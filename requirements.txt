@@ -1,0 +1,6 @@
+torch
+torchaudio
+transformers
+umap-learn
+numpy
+soundfile

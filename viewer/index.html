@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dream — latent space</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 12px/1.4 ui-monospace, Menlo, monospace; overflow: hidden; }
+  #ui { position: fixed; top: 14px; left: 14px; z-index: 10; display: flex; gap: 8px; align-items: center; }
+  button { background: #0e0e0e; color: #fff; border: 1px solid #2a2a2a; padding: 8px 14px; font: inherit; cursor: pointer; letter-spacing: 0.02em; }
+  button:hover { background: #181818; border-color: #444; }
+
+  #transport {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: grid; grid-template-columns: auto 1fr auto;
+    align-items: center; gap: 12px;
+    padding: 12px 16px 14px;
+    background: linear-gradient(to top, rgba(0,0,0,0.75), rgba(0,0,0,0));
+    z-index: 10;
+  }
+  #transport .tc { font-variant-numeric: tabular-nums; opacity: 0.7; min-width: 40px; }
+  #scrub {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 3px; background: rgba(255,255,255,0.18);
+    border-radius: 2px; outline: none; margin: 0;
+  }
+  #scrub::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #fff; cursor: pointer; border: 0;
+    box-shadow: 0 0 8px rgba(255,255,255,0.6);
+  }
+  #scrub::-moz-range-thumb {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #fff; cursor: pointer; border: 0;
+    box-shadow: 0 0 8px rgba(255,255,255,0.6);
+  }
+
+  #hint { position: fixed; top: 14px; right: 14px; opacity: 0.4; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="hint">drag to orbit · scroll to zoom</div>
+
+<div id="transport">
+  <button id="play">▶</button>
+  <input id="scrub" type="range" min="0" max="1000" step="1" value="0">
+  <span class="tc" id="tc">0:00 / 0:00</span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://esm.sh/three@0.160.0",
+    "three/addons/": "https://esm.sh/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const data = await (await fetch('./data.json')).json();
+const N = data.points.length;
+
+const audio = new Audio('./dream.wav');
+audio.preload = 'auto';
+
+// ---------- scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.FogExp2(0x000000, 0.06);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100);
+camera.position.set(2.4, 1.8, 2.8);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.zoomSpeed = 2.5;
+controls.zoomToCursor = true;
+
+// ---------- per-chunk features (pre-computed in preprocess) ----------
+const loudness   = data.loudness   ?? new Array(N).fill(0.5);
+const brightness = data.brightness ?? new Array(N).fill(0.5);
+const nnIdx   = data.neighbors?.idx   ?? null;  // [N][K]
+const nnScore = data.neighbors?.score ?? null;
+
+// ---------- data buffers ----------
+const positions = new Float32Array(N * 3);
+const colors = new Float32Array(N * 3);
+const sizes = new Float32Array(N);
+const activeness = new Float32Array(N); // 0..1, decays after playhead passes
+
+for (let i = 0; i < N; i++) {
+  const [x, y, z] = data.points[i];
+  positions[i * 3]     = x;
+  positions[i * 3 + 1] = y;
+  positions[i * 3 + 2] = z;
+
+  const t = i / Math.max(1, N - 1);
+  // hue sweeps through song time. Saturation cranked high for a vivid cloud.
+  const hue = 0.55 - 0.55 * t;
+  const sat = 0.85 + 0.15 * brightness[i];
+  const lig = 0.45 + 0.20 * brightness[i];
+  const c = new THREE.Color().setHSL(hue, sat, lig);
+  colors[i * 3]     = c.r;
+  colors[i * 3 + 1] = c.g;
+  colors[i * 3 + 2] = c.b;
+
+  // Idle sizes small so activity contrasts more strongly.
+  sizes[i] = 0.3 + loudness[i] * 0.5;
+}
+
+// ---------- point cloud ----------
+const pointGeom = new THREE.BufferGeometry();
+pointGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+pointGeom.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+pointGeom.setAttribute('aSize',    new THREE.BufferAttribute(sizes, 1));
+pointGeom.setAttribute('aActive',  new THREE.BufferAttribute(activeness, 1));
+
+const pointMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uPixelScale: { value: renderer.getPixelRatio() * 40.0 },
+  },
+  vertexShader: `
+    attribute float aSize;
+    attribute float aActive;
+    attribute vec3 color;
+    varying vec3 vColor;
+    varying float vActive;
+    uniform float uPixelScale;
+    void main() {
+      vColor = color;
+      vActive = aActive;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      // Strong swell on active so playhead + echoes pop out of a sparse cloud.
+      float boost = 1.0 + aActive * 2.8;
+      gl_PointSize = aSize * boost * (uPixelScale / -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    varying vec3 vColor;
+    varying float vActive;
+    void main() {
+      vec2 uv = gl_PointCoord - 0.5;
+      float d = length(uv);
+      if (d > 0.45) discard;
+      // Idle points stay dim; active points pop bright and slightly whiter.
+      vec3 col = mix(vColor, vec3(1.0), vActive * 0.35);
+      col *= (0.4 + vActive * 0.6);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+  transparent: false,
+  depthWrite: true,
+  blending: THREE.NormalBlending,
+});
+
+const pointCloud = new THREE.Points(pointGeom, pointMat);
+scene.add(pointCloud);
+
+// ---------- raw polyline through the embedded points ----------
+const lineGeom = new THREE.BufferGeometry();
+lineGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+lineGeom.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+const lineMat = new THREE.LineBasicMaterial({
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.25,
+  depthWrite: false,
+});
+const line = new THREE.Line(lineGeom, lineMat);
+scene.add(line);
+
+// ---------- comet trail (last ~1s of playhead positions) ----------
+const TRAIL_LEN = 60;
+const trailPositions = new Float32Array(TRAIL_LEN * 3);
+const trailColors    = new Float32Array(TRAIL_LEN * 3);
+const trailAlphas    = new Float32Array(TRAIL_LEN);
+for (let i = 0; i < TRAIL_LEN; i++) {
+  trailAlphas[i] = Math.pow(1 - i / TRAIL_LEN, 2.5);
+}
+const trailGeom = new THREE.BufferGeometry();
+trailGeom.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+trailGeom.setAttribute('aColor',   new THREE.BufferAttribute(trailColors, 3));
+trailGeom.setAttribute('aAlpha',   new THREE.BufferAttribute(trailAlphas, 1));
+const trailMat = new THREE.ShaderMaterial({
+  vertexShader: `
+    attribute vec3 aColor;
+    attribute float aAlpha;
+    varying vec3 vColor;
+    varying float vAlpha;
+    void main() {
+      vColor = aColor;
+      vAlpha = aAlpha;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    varying vec3 vColor;
+    varying float vAlpha;
+    void main() {
+      gl_FragColor = vec4(vColor, vAlpha * 0.45);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.NormalBlending,
+});
+const trail = new THREE.Line(trailGeom, trailMat);
+scene.add(trail);
+let trailInitialized = false;
+
+// ---------- playhead ----------
+const headGeom = new THREE.SphereGeometry(0.028, 20, 20);
+const headMat  = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const head     = new THREE.Mesh(headGeom, headMat);
+scene.add(head);
+
+// Helper: color at parameter u along the song (matches the point-cloud hue ramp).
+const currentColor = new THREE.Color();
+function colorAtU(u) {
+  const hue = 0.55 - 0.55 * u;
+  return currentColor.setHSL(hue, 0.75, 0.55);
+}
+
+// ---------- audio analyser ----------
+let analyser, freqData;
+function setupAnalyser() {
+  if (analyser) return;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaElementSource(audio);
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.75;
+  src.connect(analyser);
+  analyser.connect(ctx.destination);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
+}
+
+// ---------- UI ----------
+const playBtn = document.getElementById('play');
+const scrub   = document.getElementById('scrub');
+const tcEl    = document.getElementById('tc');
+
+playBtn.addEventListener('click', async () => {
+  setupAnalyser();
+  if (audio.paused) {
+    await audio.play();
+    playBtn.textContent = '⏸';
+  } else {
+    audio.pause();
+    playBtn.textContent = '▶';
+  }
+});
+
+function fmt(s) {
+  if (!isFinite(s)) return '0:00';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60).toString().padStart(2, '0');
+  return `${m}:${sec}`;
+}
+
+// User drag -> seek. Pause while dragging so audio doesn't jitter against scrub.
+let scrubbing = false;
+let wasPlaying = false;
+scrub.addEventListener('input', () => {
+  scrubbing = true;
+  const dur = isFinite(audio.duration) ? audio.duration : data.duration;
+  const t = (scrub.value / 1000) * dur;
+  audio.currentTime = t;
+  tcEl.textContent = `${fmt(t)} / ${fmt(dur)}`;
+});
+scrub.addEventListener('pointerdown', () => {
+  wasPlaying = !audio.paused;
+  if (wasPlaying) audio.pause();
+});
+scrub.addEventListener('pointerup', () => {
+  scrubbing = false;
+  if (wasPlaying) audio.play();
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  pointMat.uniforms.uPixelScale.value = renderer.getPixelRatio() * 40.0;
+});
+
+// ---------- animation ----------
+const activeAttr   = pointGeom.getAttribute('aActive');
+const trailPosAttr   = trailGeom.getAttribute('position');
+const trailColorAttr = trailGeom.getAttribute('aColor');
+
+// Map audio time -> curve parameter u in [0, 1].
+// Chunks span [0, (N-1)*hopS]; audio may extend slightly past the last chunk.
+const lastChunkTime = (N - 1) * data.hopS;
+
+// Spectral-flux onset detector
+let prevFreq = null;
+let fluxBaseline = 0;
+let pulse = 0;
+let pulseCooldown = 0;
+
+function updateOnset(dt) {
+  if (!analyser) return;
+  if (!prevFreq) prevFreq = new Uint8Array(freqData.length);
+  let flux = 0;
+  for (let i = 0; i < freqData.length; i++) {
+    const d = freqData[i] - prevFreq[i];
+    if (d > 0) flux += d;
+    prevFreq[i] = freqData[i];
+  }
+  flux /= freqData.length;
+  fluxBaseline = fluxBaseline * 0.92 + flux * 0.08;
+  pulseCooldown = Math.max(0, pulseCooldown - dt);
+  if (flux > fluxBaseline * 1.55 && flux > 3 && pulseCooldown === 0) {
+    pulse = 1.0;
+    pulseCooldown = 0.09;
+  }
+  pulse *= Math.pow(0.5, dt / 0.22); // half-life ~220ms
+}
+
+const tmpVec = new THREE.Vector3();
+let lastTime = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - lastTime) / 1000);
+  lastTime = now;
+
+  controls.update();
+
+  // audio features
+  let amp = 0;
+  if (analyser) {
+    analyser.getByteFrequencyData(freqData);
+    let s = 0;
+    for (let i = 0; i < freqData.length; i++) s += freqData[i];
+    amp = s / freqData.length / 255;
+    updateOnset(dt);
+  }
+
+  // playhead = discrete snap to the nearest embedded chunk (no interpolation)
+  const t = audio.currentTime;
+  const idx = Math.max(0, Math.min(N - 1, Math.round(t / data.hopS)));
+  const p = data.points[idx];
+  tmpVec.set(p[0], p[1], p[2]);
+  const u = Math.max(0, Math.min(1, t / lastChunkTime));
+  head.position.copy(tmpVec);
+
+  // color at current position along song
+  const col = colorAtU(u);
+
+  // core sphere: tint slightly with hue, flare on onset
+  head.material.color.lerpColors(new THREE.Color(0xffffff), col, 0.25);
+  head.scale.setScalar(1 + pulse * 0.9);
+
+
+  // trail: shift history, write newest at index 0
+  if (!trailInitialized) {
+    for (let i = 0; i < TRAIL_LEN; i++) {
+      trailPositions[i*3]     = tmpVec.x;
+      trailPositions[i*3 + 1] = tmpVec.y;
+      trailPositions[i*3 + 2] = tmpVec.z;
+      trailColors[i*3]     = col.r;
+      trailColors[i*3 + 1] = col.g;
+      trailColors[i*3 + 2] = col.b;
+    }
+    trailInitialized = true;
+  } else {
+    for (let i = TRAIL_LEN - 1; i > 0; i--) {
+      trailPositions[i*3]     = trailPositions[(i-1)*3];
+      trailPositions[i*3 + 1] = trailPositions[(i-1)*3 + 1];
+      trailPositions[i*3 + 2] = trailPositions[(i-1)*3 + 2];
+      trailColors[i*3]     = trailColors[(i-1)*3];
+      trailColors[i*3 + 1] = trailColors[(i-1)*3 + 1];
+      trailColors[i*3 + 2] = trailColors[(i-1)*3 + 2];
+    }
+    trailPositions[0] = tmpVec.x;
+    trailPositions[1] = tmpVec.y;
+    trailPositions[2] = tmpVec.z;
+    trailColors[0] = col.r;
+    trailColors[1] = col.g;
+    trailColors[2] = col.b;
+  }
+  trailPosAttr.needsUpdate   = true;
+  trailColorAttr.needsUpdate = true;
+
+  // Current chunk at full activation; neighbors fall off exponentially by rank.
+  // Rank 0 is the strongest match, gets the most weight; each subsequent rank
+  // is ~55% of the previous, so the 6th neighbor is barely visible.
+  const arr = activeAttr.array;
+  arr[idx] = 1.0;
+  if (nnIdx) {
+    const neighbors = nnIdx[idx];
+    const scores    = nnScore[idx];
+    let rankWeight = 0.85;           // neighbor 0's weight
+    const falloff  = 0.55;           // each next rank scales by this
+    for (let k = 0; k < neighbors.length; k++) {
+      const j = neighbors[k];
+      const w = rankWeight * scores[k];
+      if (w > arr[j]) arr[j] = w;
+      rankWeight *= falloff;
+    }
+  }
+  const decay = Math.pow(0.5, dt / 1.0);
+  for (let i = 0; i < N; i++) {
+    if (i !== idx) arr[i] *= decay;
+  }
+  activeAttr.needsUpdate = true;
+
+  const dur = isFinite(audio.duration) ? audio.duration : data.duration;
+  tcEl.textContent = `${fmt(t)} / ${fmt(dur)}`;
+  if (!scrubbing) scrub.value = Math.round((t / dur) * 1000);
+
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

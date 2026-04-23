@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Large generated artifacts — recreated by preprocess.py
+embeddings*.npy
+starts*.npy
+viewer/data.json
+
+# Audio — add your own WAV to the project root or Desktop
+*.wav
+*.mp3
+*.flac
+
+.DS_Store
