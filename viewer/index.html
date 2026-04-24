@@ -35,17 +35,27 @@
     box-shadow: 0 0 8px rgba(255,255,255,0.6);
   }
 
-  #hint { position: fixed; top: 14px; right: 14px; opacity: 0.4; }
+  #hint { position: fixed; bottom: 50px; right: 14px; opacity: 0.4; }
+  #record.on { background: #7a0014; border-color: #b6001e; color: #fff; }
+  #record.on::before { content: '● '; animation: rec-blink 1s infinite; }
+  @keyframes rec-blink { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
   canvas { display: block; }
 </style>
 </head>
 <body>
-<div id="hint">drag to orbit · scroll to zoom</div>
+<div id="hint">drag · scroll · F follow · [ ← advance / ] → delay</div>
+<div id="focus" style="position:fixed;top:14px;left:14px;font-variant:small-caps;letter-spacing:0.08em;color:#fff;font-family:ui-monospace,Menlo,monospace;font-size:11px;z-index:10;pointer-events:none;display:none;"></div>
+<div id="lead" style="position:fixed;top:14px;right:14px;font-variant:small-caps;letter-spacing:0.08em;color:#fff;font-family:ui-monospace,Menlo,monospace;font-size:11px;z-index:10;pointer-events:none;opacity:0.7;text-align:right;"></div>
+<div style="position:fixed;top:36px;right:14px;z-index:10;pointer-events:none;display:flex;flex-direction:column;gap:6px;align-items:flex-end;font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#fff;">
+  <div style="display:flex;align-items:center;gap:8px;opacity:0.7">audio onset<div id="beat-dot" style="width:14px;height:14px;border-radius:50%;background:#fff;opacity:0;box-shadow:0 0 8px rgba(255,255,255,0.8);"></div></div>
+  <div style="display:flex;align-items:center;gap:8px;opacity:0.7">cloud fires<div id="cloud-dot" style="width:14px;height:14px;border-radius:50%;background:#5af;opacity:0;box-shadow:0 0 8px rgba(85,170,255,0.8);"></div></div>
+</div>
 
 <div id="transport">
   <button id="play">▶</button>
   <input id="scrub" type="range" min="0" max="1000" step="1" value="0">
   <span class="tc" id="tc">0:00 / 0:00</span>
+  <button id="record" title="Press R">● rec</button>
 </div>
 
 <script type="importmap">
@@ -60,17 +70,287 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer }    from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }        from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass }        from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass }   from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { BokehPass }         from 'three/addons/postprocessing/BokehPass.js';
 
-const data = await (await fetch('./data.json')).json();
-const N = data.points.length;
+// Load the song named in ?song=<slug>, falling back to 'dream'.
+const params = new URLSearchParams(location.search);
+const SLUG = params.get('song') || 'dream';
+const data = await (await fetch(`./${SLUG}.json`)).json();
+document.title = `${data.title ?? SLUG} — latent space`;
 
-const audio = new Audio('./dream.wav');
+// If this is a multi-stem file, try to also load the parent whole-song file
+// (e.g. `flume-free-stems` → `flume-free`) so we can add the full mix as an
+// additional "mix" stem alongside the separated instruments.
+let parentMix = null;
+if (data.stems) {
+  const parentSlug = SLUG.replace(/-stems$/, '');
+  if (parentSlug !== SLUG) {
+    try {
+      const res = await fetch(`./${parentSlug}.json`);
+      if (res.ok) parentMix = await res.json();
+    } catch (e) { /* ignore — parent mix is optional */ }
+  }
+}
+
+const MULTISTEM_SCALE = 0.5;
+function scalePoints(arr, k) {
+  return arr.map(p => [p[0] * k, p[1] * k, p[2] * k]);
+}
+
+const stemList = [];
+const hasMix = !!(data.stems && parentMix && parentMix.points
+                  && parentMix.points.length === (data.stems[Object.keys(data.stems)[0]].points.length));
+const FULL_TINT = [1.0, 1.0, 1.0];
+// With a mix loaded alongside: non-mix stems have 50%-scale idle triangles
+// AND 25% lead boost. Mix has full-size triangles + 50% lead boost.
+const STEM_SIZE_MULT = hasMix ? 0.5  : 1.0;
+const STEM_LEAD      = hasMix ? 0.25 : 1.0;
+const MIX_LEAD       = 0.5;
+
+if (data.stems) {
+  for (const [name, s] of Object.entries(data.stems)) {
+    stemList.push({
+      name,
+      points:    scalePoints(s.points, MULTISTEM_SCALE),
+      loudness:  s.loudness,
+      brightness: s.brightness,
+      neighbors: s.neighbors,
+      color:     null,
+      tint:      FULL_TINT,
+      sizeMult:  STEM_SIZE_MULT,
+      leadScale: STEM_LEAD,
+      mel:       s.melVectors ? new Float32Array(s.melVectors) : null,
+      onsets:    s.onsets ?? [],
+    });
+  }
+  if (hasMix) {
+    stemList.push({
+      name:      'mix',
+      points:    scalePoints(parentMix.points, MULTISTEM_SCALE),
+      loudness:  parentMix.loudness,
+      brightness: parentMix.brightness,
+      neighbors: parentMix.neighbors,
+      color:     null,
+      tint:      FULL_TINT,
+      sizeMult:  1.0,
+      leadScale: MIX_LEAD,
+      mel:       parentMix.melVectors ? new Float32Array(parentMix.melVectors) : null,
+      onsets:    parentMix.onsets ?? [],
+    });
+  }
+} else {
+  stemList.push({
+    name: 'main',
+    points: data.points,
+    loudness: data.loudness,
+    brightness: data.brightness,
+    neighbors: data.neighbors,
+    color: null,
+    tint: FULL_TINT,
+    sizeMult: 1.0,
+    leadScale: 1.0,
+    mel: data.melVectors ? new Float32Array(data.melVectors) : null,
+    onsets: data.onsets ?? [],
+  });
+}
+// Per-stem playback state: independent time-accumulators so each stem
+// advances at its own loudness-modulated rate (not fixed 0.1s lockstep).
+for (const stem of stemList) {
+  stem.advanceClock  = 0;  // seconds since last advance
+  stem.visualIdx     = -1;
+  stem.prevVisualIdx = -1;
+}
+
+const stemCount = stemList.length;
+const stemN     = stemList[0].points.length;  // chunks per stem
+const N         = stemCount * stemN;          // total triangles across all stems
+
+const audio = new Audio(`./${data.audioFile ?? SLUG + '.wav'}`);
 audio.preload = 'auto';
+
+// audioReady = "is the audio element actively outputting sound right now?"
+// Freezes visuals during seek buffering / pause so we don't advance through
+// chunks while the element is silent (which used to cause 2–4s desync after
+// scrubbing). Tracks the stream's real output state via media events.
+let audioReady = false;
+audio.addEventListener('playing', () => { audioReady = true; });
+audio.addEventListener('pause',   () => { audioReady = false; });
+audio.addEventListener('seeking', () => { audioReady = false; });
+audio.addEventListener('waiting', () => { audioReady = false; });
+audio.addEventListener('stalled', () => { audioReady = false; });
+audio.addEventListener('ended',   () => { audioReady = false; });
+
+// When a seek completes, resync per-stem cursors to the new position so the
+// first post-seek frame doesn't fire a storm of "missed" chunks.
+audio.addEventListener('seeked', () => {
+  for (const stem of stemList) {
+    stem.visualIdx     = -1;
+    stem.prevVisualIdx = -1;
+    stem.advanceClock  = 0;
+  }
+  calibOnsetCursor = 0;
+  calibLastIdx     = -1;
+});
 
 // ---------- scene ----------
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000000);
+scene.background = new THREE.Color(0x000002);  // deepest-space near-black
+// Keep the fog; it only affects materials that opt-in, which the triangle
+// cloud and starfield both don't. Cloud stays crisp near camera, stars
+// stay crisp at distance.
 scene.fog = new THREE.FogExp2(0x000000, 0.06);
+
+// ---------- procedural starfield (skybox substitute) ----------
+// Random points on a large sphere. Four rough color temperatures — white,
+// warm yellow, cool blue, red giant — distributed at realistic proportions.
+// Rendered additively behind the main cloud so it reads as deep space.
+{
+  const STAR_COUNT = 7000;
+  const starPos   = new Float32Array(STAR_COUNT * 3);
+  const starCol   = new Float32Array(STAR_COUNT * 3);
+  const starSize  = new Float32Array(STAR_COUNT);
+  for (let i = 0; i < STAR_COUNT; i++) {
+    // Uniform distribution on a sphere at radius 30–55
+    const u = Math.random() * 2 - 1;
+    const theta = Math.random() * 2 * Math.PI;
+    const r = 30 + Math.random() * 25;
+    const sinPhi = Math.sqrt(1 - u * u);
+    starPos[i*3]     = r * sinPhi * Math.cos(theta);
+    starPos[i*3 + 1] = r * u;
+    starPos[i*3 + 2] = r * sinPhi * Math.sin(theta);
+    // Power-law size — mostly small with a few bright giants.
+    starSize[i] = 0.7 + Math.pow(Math.random(), 6) * 1.2;
+    // Color temperature — stars are mostly white, with the tint held back
+    // to 10% of its natural saturation so the field reads as white-ish
+    // with just hints of color rather than a rainbow.
+    const t = Math.random();
+    let cr, cg, cb;
+    if      (t < 0.55) { cr = 1.00; cg = 0.97; cb = 0.90; }  // yellow-white (G-type)
+    else if (t < 0.80) { cr = 0.85; cg = 0.92; cb = 1.00; }  // blue-white (B-type)
+    else if (t < 0.95) { cr = 1.00; cg = 0.60; cb = 0.45; }  // red giant (M-type)
+    else                { cr = 1.00; cg = 1.00; cb = 1.00; } // pure hot white
+    const SAT = 0.1;
+    cr = 1.0 - SAT * (1.0 - cr);
+    cg = 1.0 - SAT * (1.0 - cg);
+    cb = 1.0 - SAT * (1.0 - cb);
+    starCol[i*3] = cr; starCol[i*3 + 1] = cg; starCol[i*3 + 2] = cb;
+  }
+  const starGeom = new THREE.BufferGeometry();
+  starGeom.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+  starGeom.setAttribute('color',    new THREE.BufferAttribute(starCol, 3));
+  starGeom.setAttribute('aSize',    new THREE.BufferAttribute(starSize, 1));
+  const starMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uPixelScale: { value: Math.min(devicePixelRatio, 2) * 40.0 },
+    },
+    vertexShader: `
+      attribute float aSize;
+      attribute vec3 color;
+      varying vec3 vColor;
+      uniform float uPixelScale;
+      void main() {
+        vColor = color;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = aSize * (uPixelScale / -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      void main() {
+        vec2 uv = gl_PointCoord - 0.5;
+        float d = length(uv);
+        if (d > 0.5) discard;
+        // Bright core + soft halo for the tiny-but-glowing-point feel.
+        float core = pow(1.0 - d * 2.0, 3.5);
+        gl_FragColor = vec4(vColor, core);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  scene.add(new THREE.Points(starGeom, starMat));
+}
+
+// ---------- particle emitter (spawned on each fireHit) ----------
+const MAX_PARTICLES = 3000;
+const PART_LIFETIME = 1.3;
+const partPos = new Float32Array(MAX_PARTICLES * 3);
+const partVel = new Float32Array(MAX_PARTICLES * 3);
+const partCol = new Float32Array(MAX_PARTICLES * 3);
+const partAge = new Float32Array(MAX_PARTICLES);
+for (let i = 0; i < MAX_PARTICLES; i++) partAge[i] = PART_LIFETIME + 1;  // start dead
+let partCursor = 0;
+
+const partGeom = new THREE.BufferGeometry();
+partGeom.setAttribute('position', new THREE.BufferAttribute(partPos, 3));
+partGeom.setAttribute('color',    new THREE.BufferAttribute(partCol, 3));
+partGeom.setAttribute('aAge',     new THREE.BufferAttribute(partAge, 1));
+const partMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uLifetime:   { value: PART_LIFETIME },
+    uPixelScale: { value: Math.min(devicePixelRatio, 2) * 40.0 },
+  },
+  vertexShader: `
+    attribute float aAge;
+    attribute vec3 color;
+    varying vec3 vColor;
+    varying float vLife;
+    uniform float uLifetime;
+    uniform float uPixelScale;
+    void main() {
+      vColor = color;
+      vLife = max(0.0, 1.0 - aAge / uLifetime);
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      float size = 2.5 * pow(vLife, 1.4);
+      gl_PointSize = size * (uPixelScale / -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    varying vec3 vColor;
+    varying float vLife;
+    void main() {
+      if (vLife <= 0.0) discard;
+      vec2 uv = gl_PointCoord - 0.5;
+      float d = length(uv);
+      if (d > 0.5) discard;
+      float a = pow(1.0 - d * 2.0, 2.0) * vLife;
+      gl_FragColor = vec4(vColor, a);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+scene.add(new THREE.Points(partGeom, partMat));
+
+function emitParticles(x, y, z, r, g, b, count) {
+  for (let i = 0; i < count; i++) {
+    const c = partCursor;
+    partPos[c*3]     = x;
+    partPos[c*3 + 1] = y;
+    partPos[c*3 + 2] = z;
+    // Random unit-vector velocity
+    const u = Math.random() * 2 - 1;
+    const theta = Math.random() * Math.PI * 2;
+    const sp = 0.12 + Math.random() * 0.18;
+    const sinPhi = Math.sqrt(1 - u * u);
+    partVel[c*3]     = sp * sinPhi * Math.cos(theta);
+    partVel[c*3 + 1] = sp * u;
+    partVel[c*3 + 2] = sp * sinPhi * Math.sin(theta);
+    partCol[c*3]     = r;
+    partCol[c*3 + 1] = g;
+    partCol[c*3 + 2] = b;
+    partAge[c] = 0;
+    partCursor = (partCursor + 1) % MAX_PARTICLES;
+  }
+}
 
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100);
 camera.position.set(2.4, 1.8, 2.8);
@@ -78,52 +358,138 @@ camera.position.set(2.4, 1.8, 2.8);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
 document.body.appendChild(renderer.domElement);
+
+// ---------- post-processing: radial chromatic aberration ----------
+// Applied after the scene is rendered. For each output pixel, the R/G/B
+// channels are sampled at slightly offset UV positions along the radial
+// direction from image center — strongest at corners, zero dead-center.
+const ChromaticAberrationShader = {
+  uniforms: {
+    tDiffuse:  { value: null },
+    uStrength: { value: 0.006 },   // base radial offset (higher = stronger split)
+    uCurve:    { value: 1.8 },     // exponent on distance-from-center
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uStrength;
+    uniform float uCurve;
+    varying vec2 vUv;
+    void main() {
+      vec2 dir = vUv - vec2(0.5);
+      float d  = length(dir) * 2.0;           // 0 at center, 1 at corner (-ish)
+      float k  = uStrength * pow(d, uCurve);
+      vec2 off = normalize(dir + vec2(1e-8)) * k;
+      float r  = texture2D(tDiffuse, vUv - off).r;
+      float g  = texture2D(tDiffuse, vUv).g;
+      float b  = texture2D(tDiffuse, vUv + off).b;
+      gl_FragColor = vec4(r, g, b, 1.0);
+    }
+  `,
+};
+
+// Multisampled render target so the composer's scene pass gets 4× MSAA.
+// Huge quality win for triangle edges and starfield for minimal cost.
+const composerRT = new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
+  type: THREE.HalfFloatType,
+  samples: 4,
+});
+const composer = new EffectComposer(renderer, composerRT);
+composer.addPass(new RenderPass(scene, camera));
+// Depth-of-field: subtle focus blur that picks out the cloud's center
+// while letting far regions soften. `focus` is updated every frame from
+// the camera's distance to its current target.
+const bokehPass = new BokehPass(scene, camera, {
+  focus:    1.0,
+  aperture: 0.002,
+  maxblur:  0.004,
+});
+composer.addPass(bokehPass);
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  1.2, 0.6, 0.9,
+);
+composer.addPass(bloomPass);
+composer.addPass(new ShaderPass(ChromaticAberrationShader));
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.zoomSpeed = 2.5;
 controls.zoomToCursor = true;
+controls.screenSpacePanning = true;
+// Middle-mouse-button drag = pan (translate the view).
+// Right-click-drag also pans; scroll wheel still zooms.
+controls.mouseButtons = {
+  LEFT:   THREE.MOUSE.ROTATE,
+  MIDDLE: THREE.MOUSE.PAN,
+  RIGHT:  THREE.MOUSE.PAN,
+};
 
-// ---------- per-chunk features (pre-computed in preprocess) ----------
-const loudness   = data.loudness   ?? new Array(N).fill(0.5);
-const brightness = data.brightness ?? new Array(N).fill(0.5);
-const nnIdx   = data.neighbors?.idx   ?? null;  // [N][K]
-const nnScore = data.neighbors?.score ?? null;
-
-// ---------- data buffers ----------
+// ---------- data buffers (single cloud, all stems concatenated) ----------
 const positions = new Float32Array(N * 3);
-const colors = new Float32Array(N * 3);
-const sizes = new Float32Array(N);
-const activeness = new Float32Array(N); // 0..1, decays after playhead passes
+const sizes     = new Float32Array(N);
+const angles    = new Float32Array(N);
+const loudAttr  = new Float32Array(N);
+const stemTints = new Float32Array(N * 3);  // per-chunk stem color
 
-for (let i = 0; i < N; i++) {
-  const [x, y, z] = data.points[i];
-  positions[i * 3]     = x;
-  positions[i * 3 + 1] = y;
-  positions[i * 3 + 2] = z;
+// Per-chunk hit state.
+const timeSinceHit = new Float32Array(N);
+const hitStrength  = new Float32Array(N);
+const flashCols    = new Float32Array(N * 3);
+const sizeEnergy   = new Float32Array(N);
+const leadFlag     = new Float32Array(N);
+timeSinceHit.fill(1000);
 
-  const t = i / Math.max(1, N - 1);
-  // hue sweeps through song time. Saturation cranked high for a vivid cloud.
-  const hue = 0.55 - 0.55 * t;
-  const sat = 0.85 + 0.15 * brightness[i];
-  const lig = 0.45 + 0.20 * brightness[i];
-  const c = new THREE.Color().setHSL(hue, sat, lig);
-  colors[i * 3]     = c.r;
-  colors[i * 3 + 1] = c.g;
-  colors[i * 3 + 2] = c.b;
+for (let i = 0; i < N; i++) angles[i] = Math.random() * Math.PI * 2;
 
-  // Idle sizes small so activity contrasts more strongly.
-  sizes[i] = 0.3 + loudness[i] * 0.5;
+// Fill positions/loudness/tint by iterating stems. Chunk at stem s, local i
+// lives at globalIdx = s * stemN + i.
+for (let s = 0; s < stemCount; s++) {
+  const stem = stemList[s];
+  const off = s * stemN;
+  const tR = stem.tint ? stem.tint[0] : 1.0;
+  const tG = stem.tint ? stem.tint[1] : 1.0;
+  const tB = stem.tint ? stem.tint[2] : 1.0;
+  for (let i = 0; i < stemN; i++) {
+    const gi = off + i;
+    const [x, y, z] = stem.points[i];
+    positions[gi*3]     = x;
+    positions[gi*3 + 1] = y;
+    positions[gi*3 + 2] = z;
+    sizes[gi]    = 0.0125 * (stem.sizeMult ?? 1.0);
+    loudAttr[gi] = stem.loudness?.[i] ?? 0;
+    stemTints[gi*3]     = tR;
+    stemTints[gi*3 + 1] = tG;
+    stemTints[gi*3 + 2] = tB;
+  }
 }
+
+// Per-stem neighbor lookups (used during hit dispatch)
+const stemNeighborIdx   = stemList.map(s => s.neighbors?.idx   ?? null);
+const stemNeighborScore = stemList.map(s => s.neighbors?.score ?? null);
 
 // ---------- point cloud ----------
 const pointGeom = new THREE.BufferGeometry();
-pointGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-pointGeom.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
-pointGeom.setAttribute('aSize',    new THREE.BufferAttribute(sizes, 1));
-pointGeom.setAttribute('aActive',  new THREE.BufferAttribute(activeness, 1));
+pointGeom.setAttribute('position',  new THREE.BufferAttribute(positions, 3));
+pointGeom.setAttribute('aSize',     new THREE.BufferAttribute(sizes, 1));
+pointGeom.setAttribute('aAngle',    new THREE.BufferAttribute(angles, 1));
+pointGeom.setAttribute('aTime',     new THREE.BufferAttribute(timeSinceHit, 1));
+pointGeom.setAttribute('aStr',      new THREE.BufferAttribute(hitStrength, 1));
+pointGeom.setAttribute('aFlash',    new THREE.BufferAttribute(flashCols, 3));
+pointGeom.setAttribute('aSizeE',    new THREE.BufferAttribute(sizeEnergy, 1));
+pointGeom.setAttribute('aLoud',     new THREE.BufferAttribute(loudAttr, 1));
+pointGeom.setAttribute('aLead',     new THREE.BufferAttribute(leadFlag, 1));
+pointGeom.setAttribute('aStemTint', new THREE.BufferAttribute(stemTints, 3));
 
 const pointMat = new THREE.ShaderMaterial({
   uniforms: {
@@ -131,122 +497,192 @@ const pointMat = new THREE.ShaderMaterial({
   },
   vertexShader: `
     attribute float aSize;
-    attribute float aActive;
-    attribute vec3 color;
-    varying vec3 vColor;
-    varying float vActive;
+    attribute float aAngle;
+    attribute float aTime;
+    attribute float aStr;
+    attribute vec3  aFlash;
+    attribute float aSizeE;
+    attribute float aLoud;
+    attribute float aLead;       // 1.0 if this is the current playhead chunk
+    varying float vTime;
+    varying float vStr;
+    varying vec3  vFlash;
+    varying vec3  vStemTint;
+    varying float vAngle;
+    attribute vec3 aStemTint;
     uniform float uPixelScale;
     void main() {
-      vColor = color;
-      vActive = aActive;
+      vTime = aTime;
+      vStr  = aStr;
+      vFlash = aFlash;
+      vStemTint = aStemTint;
+      vAngle = aAngle;
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      // Strong swell on active so playhead + echoes pop out of a sparse cloud.
-      float boost = 1.0 + aActive * 2.8;
+      float sz = 0.1 * aSizeE + 0.9 * pow(aSizeE, 8.0);
+      float loudBoost = 0.1 + aLoud * 4.0;
+      // Persistent "leading" boost so the playhead triangle is always bigger
+      // than idle, plus the transient hit-energy swell on top.
+      float boost = 1.0 + sz * 6.0 * loudBoost + aLead * 2.2;
       gl_PointSize = aSize * boost * (uPixelScale / -mv.z);
       gl_Position = projectionMatrix * mv;
     }
   `,
   fragmentShader: `
-    varying vec3 vColor;
-    varying float vActive;
+    varying float vTime;
+    varying float vStr;
+    varying vec3  vFlash;
+    varying vec3  vStemTint;
+    varying float vAngle;
+
+    // Reuleaux triangle: intersection of three disks, each centered at a
+    // vertex of an equilateral triangle with circumradius R. Produces a
+    // triangular shape with bulging curved sides (constant-width curve).
+    float sdReuleaux(vec2 p, float R) {
+      const float SQ3_2 = 0.8660254;   // sqrt(3)/2
+      const float SQ3   = 1.7320508;   // sqrt(3)
+      vec2 v0 = vec2(0.0, R);
+      vec2 v1 = vec2(-R * SQ3_2, -0.5 * R);
+      vec2 v2 = vec2( R * SQ3_2, -0.5 * R);
+      float s = R * SQ3;  // side length = radius of each bounding disk
+      float d0 = length(p - v0) - s;
+      float d1 = length(p - v1) - s;
+      float d2 = length(p - v2) - s;
+      return max(max(d0, d1), d2);
+    }
+
     void main() {
       vec2 uv = gl_PointCoord - 0.5;
-      float d = length(uv);
-      if (d > 0.45) discard;
-      // Idle points stay dim; active points pop bright and slightly whiter.
-      vec3 col = mix(vColor, vec3(1.0), vActive * 0.35);
-      col *= (0.4 + vActive * 0.6);
+      float c = cos(vAngle), s = sin(vAngle);
+      vec2 q = vec2(c * uv.x + s * uv.y, -s * uv.x + c * uv.y);
+      float d = sdReuleaux(q, 0.45);
+      // Softer edge: wider AA band, inner fade extends deeper so the
+      // transition is a gentle blur rather than a crisp outline.
+      if (d > 0.03) discard;
+      float mask = smoothstep(0.03, -0.05, d);
+
+      float t = vTime;
+
+      // Hard three-phase switch (no smoothing):
+      //   t = 0             → WHITE
+      //   t in (0, 40ms]    → pure R/G/B flash (frame or two at typical fps)
+      //   t > 40ms          → WHITE fading out
+      float whiteBurst = 1.0 - step(0.002, t);
+      float colorBurst = step(0.002, t) * (1.0 - step(0.040, t));
+      float whiteFade  = step(0.040, t) * exp(-(t - 0.040) / 1.5);
+
+      // Idle + whiteFade tint by stem; flashes stay untinted (peak always white).
+      float idleFloor = 0.025;
+      float r = idleFloor * vStemTint.r + (whiteBurst + vFlash.r * colorBurst + whiteFade * vStemTint.r) * vStr;
+      float g = idleFloor * vStemTint.g + (whiteBurst + vFlash.g * colorBurst + whiteFade * vStemTint.g) * vStr;
+      float b = idleFloor * vStemTint.b + (whiteBurst + vFlash.b * colorBurst + whiteFade * vStemTint.b) * vStr;
+
+      r = min(r, 1.0); g = min(g, 1.0); b = min(b, 1.0);
+
+      vec3 col = vec3(r, g, b) * mask;
       gl_FragColor = vec4(col, 1.0);
     }
   `,
-  transparent: false,
-  depthWrite: true,
-  blending: THREE.NormalBlending,
+  transparent: true,
+  depthWrite: false,       // additive blending is order-independent
+  blending: THREE.AdditiveBlending,
 });
+
+// Index buffer lets us render points back-to-front for correct transparency.
+const pointIdx = new Uint32Array(N);
+for (let i = 0; i < N; i++) pointIdx[i] = i;
+pointGeom.setIndex(new THREE.BufferAttribute(pointIdx, 1));
+const pointIndexAttr = pointGeom.getIndex();
 
 const pointCloud = new THREE.Points(pointGeom, pointMat);
 scene.add(pointCloud);
 
-// ---------- raw polyline through the embedded points ----------
-const lineGeom = new THREE.BufferGeometry();
-lineGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-lineGeom.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
-const lineMat = new THREE.LineBasicMaterial({
-  vertexColors: true,
-  transparent: true,
-  opacity: 0.25,
-  depthWrite: false,
-});
-const line = new THREE.Line(lineGeom, lineMat);
-scene.add(line);
+// Scratch buffers reused each frame for the depth sort.
+const pointCamZ = new Float32Array(N);
+const pointOrder = new Array(N);
+for (let i = 0; i < N; i++) pointOrder[i] = i;
 
-// ---------- comet trail (last ~1s of playhead positions) ----------
-const TRAIL_LEN = 60;
-const trailPositions = new Float32Array(TRAIL_LEN * 3);
-const trailColors    = new Float32Array(TRAIL_LEN * 3);
-const trailAlphas    = new Float32Array(TRAIL_LEN);
-for (let i = 0; i < TRAIL_LEN; i++) {
-  trailAlphas[i] = Math.pow(1 - i / TRAIL_LEN, 2.5);
-}
-const trailGeom = new THREE.BufferGeometry();
-trailGeom.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
-trailGeom.setAttribute('aColor',   new THREE.BufferAttribute(trailColors, 3));
-trailGeom.setAttribute('aAlpha',   new THREE.BufferAttribute(trailAlphas, 1));
-const trailMat = new THREE.ShaderMaterial({
-  vertexShader: `
-    attribute vec3 aColor;
-    attribute float aAlpha;
-    varying vec3 vColor;
-    varying float vAlpha;
-    void main() {
-      vColor = aColor;
-      vAlpha = aAlpha;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
-  fragmentShader: `
-    varying vec3 vColor;
-    varying float vAlpha;
-    void main() {
-      gl_FragColor = vec4(vColor, vAlpha * 0.45);
-    }
-  `,
-  transparent: true,
-  depthWrite: false,
-  blending: THREE.NormalBlending,
-});
-const trail = new THREE.Line(trailGeom, trailMat);
-scene.add(trail);
-let trailInitialized = false;
 
-// ---------- playhead ----------
-const headGeom = new THREE.SphereGeometry(0.028, 20, 20);
-const headMat  = new THREE.MeshBasicMaterial({ color: 0xffffff });
-const head     = new THREE.Mesh(headGeom, headMat);
-scene.add(head);
 
-// Helper: color at parameter u along the song (matches the point-cloud hue ramp).
-const currentColor = new THREE.Color();
-function colorAtU(u) {
-  const hue = 0.55 - 0.55 * u;
-  return currentColor.setHSL(hue, 0.75, 0.55);
-}
 
 // ---------- audio analyser ----------
-let analyser, freqData;
+let analyser, freqData, audioStreamDest;
 function setupAnalyser() {
   if (analyser) return;
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const src = ctx.createMediaElementSource(audio);
   analyser = ctx.createAnalyser();
   analyser.fftSize = 256;
-  analyser.smoothingTimeConstant = 0.75;
+  analyser.smoothingTimeConstant = 0.1;
   src.connect(analyser);
   analyser.connect(ctx.destination);
+  // Extra tap for recording: same source fed to a MediaStreamDestination.
+  audioStreamDest = ctx.createMediaStreamDestination();
+  src.connect(audioStreamDest);
   freqData = new Uint8Array(analyser.frequencyBinCount);
 }
 
 // ---------- UI ----------
+// ---------- recording (canvas + audio → webm) ----------
+const recordBtn = document.getElementById('record');
+let mediaRecorder = null;
+let recordChunks  = [];
+
+async function toggleRecord() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    return;
+  }
+  // Require the audio graph to exist so we can tap its stream.
+  setupAnalyser();
+  const canvasStream = renderer.domElement.captureStream(60);
+  const videoTrack   = canvasStream.getVideoTracks()[0];
+  const tracks = [videoTrack];
+  if (audioStreamDest) tracks.push(audioStreamDest.stream.getAudioTracks()[0]);
+  const combined = new MediaStream(tracks);
+
+  // Prefer MP4 (H.264+AAC) — Safari outputs this natively, no conversion
+  // needed for Instagram/Twitter/etc. Chrome/Firefox fall back to webm.
+  const candidates = [
+    'video/mp4;codecs=h264,aac',
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  const mimeType = candidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
+  const ext      = mimeType.includes('mp4') ? 'mp4' : 'webm';
+
+  mediaRecorder = new MediaRecorder(combined, {
+    mimeType,
+    videoBitsPerSecond: 10_000_000,
+  });
+  recordChunks = [];
+  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordChunks.push(e.data); };
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(recordChunks, { type: mimeType || `video/${ext}` });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `song-viz-${SLUG}-${Date.now()}.${ext}`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    recordBtn.classList.remove('on');
+    recordBtn.textContent = '● rec';
+  };
+  mediaRecorder.start(500);  // emit chunks every 500ms
+  recordBtn.classList.add('on');
+  recordBtn.textContent = 'stop';
+}
+recordBtn.addEventListener('click', toggleRecord);
+addEventListener('keydown', (e) => {
+  if ((e.key === 'r' || e.key === 'R') && !e.ctrlKey && !e.metaKey) {
+    // Avoid triggering when focus is in the scrub slider etc.
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+    toggleRecord();
+  }
+});
+
 const playBtn = document.getElementById('play');
 const scrub   = document.getElementById('scrub');
 const tcEl    = document.getElementById('tc');
@@ -292,25 +728,33 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  composerRT.setSize(innerWidth, innerHeight);
+  bloomPass.setSize(innerWidth, innerHeight);
+  bokehPass.setSize(innerWidth, innerHeight);
   pointMat.uniforms.uPixelScale.value = renderer.getPixelRatio() * 40.0;
 });
 
 // ---------- animation ----------
-const activeAttr   = pointGeom.getAttribute('aActive');
-const trailPosAttr   = trailGeom.getAttribute('position');
-const trailColorAttr = trailGeom.getAttribute('aColor');
+const aTimeAttr  = pointGeom.getAttribute('aTime');
+const aStrAttr   = pointGeom.getAttribute('aStr');
+const aFlashAttr = pointGeom.getAttribute('aFlash');
+const sizeEAttr  = pointGeom.getAttribute('aSizeE');
+const aLeadAttr  = pointGeom.getAttribute('aLead');
 
 // Map audio time -> curve parameter u in [0, 1].
 // Chunks span [0, (N-1)*hopS]; audio may extend slightly past the last chunk.
-const lastChunkTime = (N - 1) * data.hopS;
+const lastChunkTime = (stemN - 1) * data.hopS;
 
 // Spectral-flux onset detector
 let prevFreq = null;
 let fluxBaseline = 0;
 let pulse = 0;
 let pulseCooldown = 0;
+let onsetFired = false;  // true for the single frame an onset triggers
 
 function updateOnset(dt) {
+  onsetFired = false;
   if (!analyser) return;
   if (!prevFreq) prevFreq = new Uint8Array(freqData.length);
   let flux = 0;
@@ -325,12 +769,95 @@ function updateOnset(dt) {
   if (flux > fluxBaseline * 1.55 && flux > 3 && pulseCooldown === 0) {
     pulse = 1.0;
     pulseCooldown = 0.09;
+    onsetFired = true;
   }
-  pulse *= Math.pow(0.5, dt / 0.22); // half-life ~220ms
+  pulse *= Math.pow(0.5, dt / 0.1); // half-life ~100ms — flash then quick tail
 }
 
-const tmpVec = new THREE.Vector3();
 let lastTime = performance.now();
+
+// ---------- follow camera (toggled with F) ----------
+// In follow mode we bypass OrbitControls and drive the camera directly:
+//  - position eased toward an adaptive orbit around the action centroid
+//  - orientation slerped in quaternion space toward a look-at target
+let followMode = false;
+const followTarget = new THREE.Vector3();   // smoothed aim point
+const followCamPos = new THREE.Vector3();   // smoothed camera position
+const followCamQuat = new THREE.Quaternion(); // smoothed orientation
+
+function enterFollowMode() {
+  followMode = true;
+  followTarget.copy(controls.target);
+  followCamPos.copy(camera.position);
+  followCamQuat.copy(camera.quaternion);
+  controls.enabled = false;
+}
+function exitFollowMode() {
+  followMode = false;
+  controls.target.copy(followTarget);
+  controls.enabled = true;
+  controls.update();
+}
+// Which stem the follow camera focuses on. -1 means "weighted blend of all stems".
+// Keys 1..stemCount pick a single stem; 0 returns to the blend.
+let focusStem = stemCount > 1 ? 0 : -1;
+const focusEl = document.getElementById('focus');
+
+// Visual lead (seconds ahead/behind of audio). Adjustable live via [ and ].
+// Empirically calibrated: +700ms covers chunk-start alignment (~500ms)
+// plus ~200ms of additional audio/display latency in this setup.
+let VISUAL_LEAD = 0.7;
+const leadEl = document.getElementById('lead');
+const beatDotEl = document.getElementById('beat-dot');
+const cloudDotEl = document.getElementById('cloud-dot');
+let cloudDotPulse = 0;
+// Calibration cloud-dot driven by the primary stem's precomputed onsets.
+const primaryStem = stemList.find(s => s.name === 'mix') || stemList[0];
+let calibOnsetCursor = 0;
+let calibLastIdx = -1;
+function updateLeadUI() {
+  const ms = Math.round(VISUAL_LEAD * 1000);
+  leadEl.textContent = `lead ${ms >= 0 ? '+' : ''}${ms}ms`;
+}
+updateLeadUI();
+
+addEventListener('keydown', (e) => {
+  if (e.key === 'f' || e.key === 'F') {
+    if (followMode) exitFollowMode(); else enterFollowMode();
+  } else if (e.key === '[' || e.key === ']' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    // [ / ← advance visuals (fire earlier). ] / → delay them (fire later).
+    const advance = e.key === '[' || e.key === 'ArrowLeft';
+    const step = (e.shiftKey ? 0.005 : 0.05) * (advance ? 1 : -1);
+    VISUAL_LEAD = Math.max(-1, Math.min(1.5, VISUAL_LEAD + step));
+    updateLeadUI();
+    e.preventDefault();
+  } else if (stemCount > 1 && /^[0-9]$/.test(e.key)) {
+    const n = parseInt(e.key, 10);
+    if (n === 0) focusStem = -1;
+    else if (n >= 1 && n <= stemCount) focusStem = n - 1;
+    updateFocusUI();
+  }
+});
+
+function updateFocusUI() {
+  if (!focusEl) return;
+  if (stemCount <= 1) { focusEl.style.display = 'none'; return; }
+  const names = stemList.map(s => s.name);
+  focusEl.innerHTML = names.map((n, i) => {
+    const on = i === focusStem;
+    return `<span style="opacity:${on ? 1 : 0.4}">${i + 1}·${n}</span>`;
+  }).concat([`<span style="opacity:${focusStem === -1 ? 1 : 0.4}">0·all</span>`]).join('  ');
+  focusEl.style.display = 'block';
+}
+updateFocusUI();
+
+// Scratch
+const _centroid  = new THREE.Vector3();
+const _desiredP  = new THREE.Vector3();
+const _lookM     = new THREE.Matrix4();
+const _desiredQ  = new THREE.Quaternion();
+const _upVec     = new THREE.Vector3(0, 1, 0);
+let followRadius = 0.5;  // smoothed across frames so focus-switches don't jolt
 
 function animate() {
   requestAnimationFrame(animate);
@@ -338,9 +865,11 @@ function animate() {
   const dt = Math.min(0.1, (now - lastTime) / 1000);
   lastTime = now;
 
-  controls.update();
+  // Audio-time index (continuous, used for camera follow).
+  const t = audio.currentTime;
+  const audioIdx = Math.max(0, Math.min(stemN - 1, Math.round((t - data.windowS * 0.5 + VISUAL_LEAD) / data.hopS)));
 
-  // audio features
+  // Audio features — sampled up here so follow-mode can react to amplitude.
   let amp = 0;
   if (analyser) {
     analyser.getByteFrequencyData(freqData);
@@ -349,81 +878,252 @@ function animate() {
     amp = s / freqData.length / 255;
     updateOnset(dt);
   }
-
-  // playhead = discrete snap to the nearest embedded chunk (no interpolation)
-  const t = audio.currentTime;
-  const idx = Math.max(0, Math.min(N - 1, Math.round(t / data.hopS)));
-  const p = data.points[idx];
-  tmpVec.set(p[0], p[1], p[2]);
-  const u = Math.max(0, Math.min(1, t / lastChunkTime));
-  head.position.copy(tmpVec);
-
-  // color at current position along song
-  const col = colorAtU(u);
-
-  // core sphere: tint slightly with hue, flare on onset
-  head.material.color.lerpColors(new THREE.Color(0xffffff), col, 0.25);
-  head.scale.setScalar(1 + pulse * 0.9);
-
-
-  // trail: shift history, write newest at index 0
-  if (!trailInitialized) {
-    for (let i = 0; i < TRAIL_LEN; i++) {
-      trailPositions[i*3]     = tmpVec.x;
-      trailPositions[i*3 + 1] = tmpVec.y;
-      trailPositions[i*3 + 2] = tmpVec.z;
-      trailColors[i*3]     = col.r;
-      trailColors[i*3 + 1] = col.g;
-      trailColors[i*3 + 2] = col.b;
+  // Calibration dots:
+  //   white = live audio-stream onset (ground truth)
+  //   blue  = the cloud reached a precomputed-onset chunk (what the viz is
+  //           responding to). If these pulse in sync the lead is correct.
+  if (beatDotEl) {
+    if (onsetFired) beatDotEl.style.opacity = '1';
+    else beatDotEl.style.opacity = String(Math.max(0, parseFloat(beatDotEl.style.opacity || '0') - dt * 4));
+  }
+  if (cloudDotEl && primaryStem?.onsets) {
+    if (audioReady) {
+      if (audioIdx < calibLastIdx - 2) {
+        calibOnsetCursor = 0;
+        while (calibOnsetCursor < primaryStem.onsets.length
+               && primaryStem.onsets[calibOnsetCursor] < audioIdx) calibOnsetCursor++;
+      }
+      calibLastIdx = audioIdx;
+      while (calibOnsetCursor < primaryStem.onsets.length
+             && primaryStem.onsets[calibOnsetCursor] <= audioIdx) {
+        cloudDotPulse = 1;
+        calibOnsetCursor++;
+      }
     }
-    trailInitialized = true;
+    cloudDotEl.style.opacity = String(cloudDotPulse);
+    cloudDotPulse = Math.max(0, cloudDotPulse - dt * 4);
+  }
+
+
+  if (followMode) {
+    const LEAD_CHUNKS = 10;
+    const leadIdx = Math.min(stemN - 1, audioIdx + LEAD_CHUNKS);
+    const WIN = 20, SIGMA = 10;
+    const iLo = Math.max(0, leadIdx - WIN);
+    const iHi = Math.min(stemN - 1, leadIdx + WIN);
+
+    // If focusStem >= 0, only that stem contributes to the centroid — camera
+    // locks to one instrument's trajectory. Otherwise, weighted blend of all.
+    const stemIter = focusStem >= 0 ? [focusStem] : stemList.map((_, i) => i);
+
+    let cx = 0, cy = 0, cz = 0, cw = 0;
+    for (const s of stemIter) {
+      const off3 = s * stemN * 3;
+      let sx = 0, sy = 0, sz = 0, sw = 0;
+      for (let i = iLo; i <= iHi; i++) {
+        const d = i - leadIdx;
+        const w = Math.exp(-0.5 * (d / SIGMA) * (d / SIGMA));
+        sx += positions[off3 + i*3]     * w;
+        sy += positions[off3 + i*3 + 1] * w;
+        sz += positions[off3 + i*3 + 2] * w;
+        sw += w;
+      }
+      sx /= sw; sy /= sw; sz /= sw;
+      const stemLoud = stemList[s].loudness?.[leadIdx] ?? 0.3;
+      const stemWeight = focusStem >= 0 ? 1 : (0.3 + stemLoud);
+      cx += sx * stemWeight;
+      cy += sy * stemWeight;
+      cz += sz * stemWeight;
+      cw += stemWeight;
+    }
+    _centroid.set(cx / cw, cy / cw, cz / cw);
+
+    // Spread = RMS distance from centroid over whichever stems we're following.
+    let ss = 0, sw = 0;
+    for (const s of stemIter) {
+      const off3 = s * stemN * 3;
+      const li = off3 + leadIdx * 3;
+      const dx = positions[li]     - _centroid.x;
+      const dy = positions[li + 1] - _centroid.y;
+      const dz = positions[li + 2] - _centroid.z;
+      ss += dx*dx + dy*dy + dz*dz;
+      sw += 1;
+    }
+    const spread = sw > 0 ? Math.sqrt(ss / sw) : 0.3;
+
+    // --- smooth target (longer time-constant so focus-switches ease in) ---
+    const tLerp = 1 - Math.exp(-dt / 1.3);
+    followTarget.lerp(_centroid, tLerp);
+
+    // --- desired camera position: slow auto-orbit at adaptive distance ---
+    const now2 = now / 1000;
+    const desiredRadius = Math.max(0.093, spread * 1.13 + 0.087) * (1.0 + amp * 0.4);
+    // Smooth the radius separately so focus-switches (which can change
+    // spread abruptly) don't cause the camera to rush in or out.
+    const rLerp = 1 - Math.exp(-dt / 1.3);
+    followRadius += (desiredRadius - followRadius) * rLerp;
+    const radius = followRadius;
+    const phi    = now2 * 0.09;                         // slow orbit
+    const theta  = 0.55 + 0.08 * Math.sin(now2 * 0.04); // slight elevation drift
+    _desiredP.set(
+      followTarget.x + radius * Math.cos(theta) * Math.cos(phi),
+      followTarget.y + radius * Math.sin(theta),
+      followTarget.z + radius * Math.cos(theta) * Math.sin(phi),
+    );
+
+    // --- smooth camera position ---
+    const pLerp = 1 - Math.exp(-dt / 1.8);   // ~1.8s inertia on position
+    followCamPos.lerp(_desiredP, pLerp);
+    camera.position.copy(followCamPos);
+
+    // --- quaternion slerp toward look-at ---
+    _lookM.lookAt(camera.position, followTarget, _upVec);
+    _desiredQ.setFromRotationMatrix(_lookM);
+    const qLerp = 1 - Math.exp(-dt / 0.9);   // ~0.9s rotational inertia
+    followCamQuat.slerp(_desiredQ, qLerp);
+    camera.quaternion.copy(followCamQuat);
   } else {
-    for (let i = TRAIL_LEN - 1; i > 0; i--) {
-      trailPositions[i*3]     = trailPositions[(i-1)*3];
-      trailPositions[i*3 + 1] = trailPositions[(i-1)*3 + 1];
-      trailPositions[i*3 + 2] = trailPositions[(i-1)*3 + 2];
-      trailColors[i*3]     = trailColors[(i-1)*3];
-      trailColors[i*3 + 1] = trailColors[(i-1)*3 + 1];
-      trailColors[i*3 + 2] = trailColors[(i-1)*3 + 2];
-    }
-    trailPositions[0] = tmpVec.x;
-    trailPositions[1] = tmpVec.y;
-    trailPositions[2] = tmpVec.z;
-    trailColors[0] = col.r;
-    trailColors[1] = col.g;
-    trailColors[2] = col.b;
+    controls.update();
   }
-  trailPosAttr.needsUpdate   = true;
-  trailColorAttr.needsUpdate = true;
 
-  // Current chunk at full activation; neighbors fall off exponentially by rank.
-  // Rank 0 is the strongest match, gets the most weight; each subsequent rank
-  // is ~55% of the previous, so the 6th neighbor is barely visible.
-  const arr = activeAttr.array;
-  arr[idx] = 1.0;
-  if (nnIdx) {
-    const neighbors = nnIdx[idx];
-    const scores    = nnScore[idx];
-    let rankWeight = 0.85;           // neighbor 0's weight
-    const falloff  = 0.55;           // each next rank scales by this
-    for (let k = 0; k < neighbors.length; k++) {
-      const j = neighbors[k];
-      const w = rankWeight * scores[k];
-      if (w > arr[j]) arr[j] = w;
-      rankWeight *= falloff;
+  // Back-to-front sort so translucent edges composite correctly.
+  // pointCloud has identity world matrix, so camera.matrixWorldInverse is the viewMatrix.
+  camera.updateMatrixWorld();
+  const m = camera.matrixWorldInverse.elements;
+  for (let i = 0; i < N; i++) {
+    const px = positions[i*3], py = positions[i*3 + 1], pz = positions[i*3 + 2];
+    // z component of (viewMatrix * position)
+    pointCamZ[i] = m[2]*px + m[6]*py + m[10]*pz + m[14];
+  }
+  pointOrder.sort((a, b) => pointCamZ[a] - pointCamZ[b]);  // ascending z = back → front
+  for (let i = 0; i < N; i++) pointIdx[i] = pointOrder[i];
+  pointIndexAttr.needsUpdate = true;
+
+  // (idx and amp computed at the top of the frame — used both here and by follow mode.)
+
+  const tArr = aTimeAttr.array;
+  const sArr = aStrAttr.array;
+  const fArr = aFlashAttr.array;
+  const szE  = sizeEAttr.array;
+  // Advance clocks FIRST so the reset-to-0 below isn't immediately incremented —
+  // that way the hit frame actually renders with vTime=0 (the white burst).
+  const sizeDecay = Math.pow(0.5, dt / 0.35);
+  for (let i = 0; i < N; i++) {
+    tArr[i] += dt;
+    szE[i]  *= sizeDecay;
+  }
+
+  // Particle physics: integrate position, damp velocity, age.
+  const velDamp = Math.pow(0.5, dt / 0.6);
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    if (partAge[i] >= PART_LIFETIME) continue;
+    partPos[i*3]     += partVel[i*3]     * dt;
+    partPos[i*3 + 1] += partVel[i*3 + 1] * dt;
+    partPos[i*3 + 2] += partVel[i*3 + 2] * dt;
+    partVel[i*3]     *= velDamp;
+    partVel[i*3 + 1] *= velDamp;
+    partVel[i*3 + 2] *= velDamp;
+    partAge[i] += dt;
+  }
+  partGeom.attributes.position.needsUpdate = true;
+  partGeom.attributes.aAge.needsUpdate      = true;
+
+  const leadArr = aLeadAttr.array;
+
+  // Fire a hit at (stem s, chunk c): reset the chunk's time/strength/flash,
+  // trigger its NN echoes, and emit particles at its position scaled by loudness.
+  function fireHit(s, c) {
+    const stem = stemList[s];
+    const off  = s * stemN;
+    const gi   = off + c;
+    const hitLoud = stem.loudness?.[c] ?? 0;
+    const hitMag = 1.0 + hitLoud * 2.5;
+    let fr, fg, fb;
+    if (stem.color) {
+      fr = stem.color[0]; fg = stem.color[1]; fb = stem.color[2];
+    } else {
+      const pick = Math.floor(Math.random() * 3);
+      fr = pick === 0 ? 1 : 0;
+      fg = pick === 1 ? 1 : 0;
+      fb = pick === 2 ? 1 : 0;
+    }
+    tArr[gi] = 0;
+    sArr[gi] = hitMag;
+    fArr[gi*3] = fr; fArr[gi*3 + 1] = fg; fArr[gi*3 + 2] = fb;
+    if (szE[gi] < 1.0) szE[gi] = 1.0;
+
+    // Spawn particles at this chunk's position — count scales with loudness.
+    const count = Math.floor(1 + hitLoud * 8);
+    const px = positions[gi*3], py = positions[gi*3 + 1], pz = positions[gi*3 + 2];
+    emitParticles(px, py, pz, fr, fg, fb, count);
+    const nni = stemNeighborIdx[s];
+    const nns = stemNeighborScore[s];
+    if (nni) {
+      const neighbors = nni[c];
+      const scores    = nns[c];
+      let rankWeight = 0.85;
+      const falloff  = 0.55;
+      for (let k = 0; k < neighbors.length; k++) {
+        const j = off + neighbors[k];
+        const w = rankWeight * scores[k];
+        tArr[j] = 0;
+        sArr[j] = w * hitMag;
+        fArr[j*3] = fr; fArr[j*3 + 1] = fg; fArr[j*3 + 2] = fb;
+        if (szE[j] < w) szE[j] = w;
+        rankWeight *= falloff;
+      }
     }
   }
-  const decay = Math.pow(0.5, dt / 1.0);
-  for (let i = 0; i < N; i++) {
-    if (i !== idx) arr[i] *= decay;
+
+  // Per-stem advance only runs when audio is actually producing sound —
+  // stays frozen during seek-buffering / pause so the visualization doesn't
+  // race ahead of silent audio.
+  const PERIOD = 0.1;
+  const LOUD_FLOOR = 0.105;
+  if (audioReady) {
+    for (let s = 0; s < stemCount; s++) {
+      const stem = stemList[s];
+      stem.advanceClock += dt;
+      if (stem.advanceClock >= PERIOD) {
+        stem.advanceClock = 0;
+        const loud = stem.loudness?.[audioIdx] ?? 0.3;
+        if (loud > LOUD_FLOOR && stem.visualIdx !== audioIdx) {
+          stem.visualIdx = audioIdx;
+          fireHit(s, audioIdx);
+        }
+      }
+    }
   }
-  activeAttr.needsUpdate = true;
+
+  // Lead-flag update per stem (runs every frame so the UI reflects state
+  // even while paused, just doesn't retrigger hits).
+  for (let s = 0; s < stemCount; s++) {
+    const stem = stemList[s];
+    const off = s * stemN;
+    if (stem.prevVisualIdx >= 0 && stem.prevVisualIdx !== stem.visualIdx) {
+      leadArr[off + stem.prevVisualIdx] = 0;
+    }
+    if (stem.visualIdx >= 0) {
+      leadArr[off + stem.visualIdx] = stem.leadScale ?? 1.0;
+    }
+    stem.prevVisualIdx = stem.visualIdx;
+  }
+  aLeadAttr.needsUpdate = true;
+  aTimeAttr.needsUpdate  = true;
+  aStrAttr.needsUpdate   = true;  // still needed: hit overwrites each frame it happens
+  aFlashAttr.needsUpdate = true;
+  sizeEAttr.needsUpdate  = true;
 
   const dur = isFinite(audio.duration) ? audio.duration : data.duration;
   tcEl.textContent = `${fmt(t)} / ${fmt(dur)}`;
   if (!scrubbing) scrub.value = Math.round((t / dur) * 1000);
 
-  renderer.render(scene, camera);
+  // Keep DOF focus locked on the cloud center (follow target in follow mode,
+  // orbit target otherwise). Distance in world units = camera → target.
+  const focusTarget = followMode ? followTarget : controls.target;
+  bokehPass.uniforms.focus.value = camera.position.distanceTo(focusTarget);
+
+  composer.render();
 }
 animate();
 </script>
