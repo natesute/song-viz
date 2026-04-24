@@ -109,7 +109,7 @@ const FULL_TINT = [1.0, 1.0, 1.0];
 // AND 25% lead boost. Mix has full-size triangles + 50% lead boost.
 const STEM_SIZE_MULT = hasMix ? 0.5  : 1.0;
 const STEM_LEAD      = hasMix ? 0.25 : 1.0;
-const MIX_LEAD       = 0.5;
+const MIX_LEAD       = 0.25;  // match instrument stems — was previously 0.5 (brighter)
 
 if (data.stems) {
   for (const [name, s] of Object.entries(data.stems)) {
@@ -416,7 +416,7 @@ const bokehPass = new BokehPass(scene, camera, {
 composer.addPass(bokehPass);
 const bloomPass = new UnrealBloomPass(
   new THREE.Vector2(innerWidth, innerHeight),
-  1.2, 0.6, 0.9,
+  1.0, 0.6, 0.9,
 );
 composer.addPass(bloomPass);
 composer.addPass(new ShaderPass(ChromaticAberrationShader));
@@ -627,14 +627,29 @@ const recordBtn = document.getElementById('record');
 let mediaRecorder = null;
 let recordChunks  = [];
 
+// Save original pass-enabled state so we can restore after recording stops.
+const _passStash = {};
+function setRecordingLiteMode(on) {
+  if (on) {
+    _passStash.bokeh = bokehPass.enabled;
+    bokehPass.enabled = false;  // skips the extra scene depth render
+    // Bloom stays on (it's the signature look) and chromatic aberration
+    // stays on (it's cheap).
+  } else {
+    if ('bokeh' in _passStash) bokehPass.enabled = _passStash.bokeh;
+  }
+}
+
 async function toggleRecord() {
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.stop();
+    setRecordingLiteMode(false);
     return;
   }
   // Require the audio graph to exist so we can tap its stream.
   setupAnalyser();
-  const canvasStream = renderer.domElement.captureStream(60);
+  // 30fps recording — half the encoder CPU of 60fps, still smooth for social.
+  const canvasStream = renderer.domElement.captureStream(30);
   const videoTrack   = canvasStream.getVideoTracks()[0];
   const tracks = [videoTrack];
   if (audioStreamDest) tracks.push(audioStreamDest.stream.getAudioTracks()[0]);
@@ -670,7 +685,8 @@ async function toggleRecord() {
     recordBtn.classList.remove('on');
     recordBtn.textContent = '● rec';
   };
-  mediaRecorder.start(500);  // emit chunks every 500ms
+  setRecordingLiteMode(true);
+  mediaRecorder.start(500);
   recordBtn.classList.add('on');
   recordBtn.textContent = 'stop';
 }
@@ -957,7 +973,7 @@ function animate() {
 
     // --- desired camera position: slow auto-orbit at adaptive distance ---
     const now2 = now / 1000;
-    const desiredRadius = Math.max(0.093, spread * 1.13 + 0.087) * (1.0 + amp * 0.4);
+    const desiredRadius = Math.max(0.112, spread * 1.36 + 0.104) * (1.0 + amp * 0.4);
     // Smooth the radius separately so focus-switches (which can change
     // spread abruptly) don't cause the camera to rush in or out.
     const rLerp = 1 - Math.exp(-dt / 1.3);
@@ -971,35 +987,40 @@ function animate() {
       followTarget.z + radius * Math.cos(theta) * Math.sin(phi),
     );
 
-    // --- smooth camera position ---
-    const pLerp = 1 - Math.exp(-dt / 1.8);   // ~1.8s inertia on position
+    // Smooth the camera position (gives cinematic feel on view changes).
+    // Then enforce a minimum distance from the target so even during the
+    // smoothing-induced lag, the lead can't approach or pass behind us.
+    const pLerp = 1 - Math.exp(-dt / 0.9);  // 0.9s — smooth but responsive
     followCamPos.lerp(_desiredP, pLerp);
+
+    const MIN_CAM_DIST_FACTOR = 0.7;
+    const awayX = followCamPos.x - followTarget.x;
+    const awayY = followCamPos.y - followTarget.y;
+    const awayZ = followCamPos.z - followTarget.z;
+    const curDist = Math.sqrt(awayX * awayX + awayY * awayY + awayZ * awayZ);
+    const minDist = radius * MIN_CAM_DIST_FACTOR;
+    if (curDist < minDist && curDist > 1e-4) {
+      const k = minDist / curDist;
+      followCamPos.set(
+        followTarget.x + awayX * k,
+        followTarget.y + awayY * k,
+        followTarget.z + awayZ * k,
+      );
+    }
     camera.position.copy(followCamPos);
 
     // --- quaternion slerp toward look-at ---
     _lookM.lookAt(camera.position, followTarget, _upVec);
     _desiredQ.setFromRotationMatrix(_lookM);
-    const qLerp = 1 - Math.exp(-dt / 0.9);   // ~0.9s rotational inertia
+    const qLerp = 1 - Math.exp(-dt / 0.5);
     followCamQuat.slerp(_desiredQ, qLerp);
     camera.quaternion.copy(followCamQuat);
   } else {
     controls.update();
   }
 
-  // Back-to-front sort so translucent edges composite correctly.
-  // pointCloud has identity world matrix, so camera.matrixWorldInverse is the viewMatrix.
-  camera.updateMatrixWorld();
-  const m = camera.matrixWorldInverse.elements;
-  for (let i = 0; i < N; i++) {
-    const px = positions[i*3], py = positions[i*3 + 1], pz = positions[i*3 + 2];
-    // z component of (viewMatrix * position)
-    pointCamZ[i] = m[2]*px + m[6]*py + m[10]*pz + m[14];
-  }
-  pointOrder.sort((a, b) => pointCamZ[a] - pointCamZ[b]);  // ascending z = back → front
-  for (let i = 0; i < N; i++) pointIdx[i] = pointOrder[i];
-  pointIndexAttr.needsUpdate = true;
-
-  // (idx and amp computed at the top of the frame — used both here and by follow mode.)
+  // (Per-frame depth sort removed — we render with AdditiveBlending which
+  // is order-independent, so the sort was dead work costing ~1–2ms/frame.)
 
   const tArr = aTimeAttr.array;
   const sArr = aStrAttr.array;
