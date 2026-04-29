@@ -4,14 +4,22 @@
 <meta charset="utf-8">
 <title>dream — latent space</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 12px/1.4 ui-monospace, Menlo, monospace; overflow: hidden; }
+  html, body {
+    margin: 0; height: 100%; color: #fff; font: 12px/1.4 ui-monospace, Menlo, monospace;
+    overflow: hidden;
+    /* Subtle radial backdrop — center slightly lifted from pure black,
+       edges true black. Gives the visualizer a sense of depth/atmosphere
+       instead of feeling like it's floating in a flat void. */
+    background:
+      radial-gradient(ellipse at center, #0a0d18 0%, #050709 55%, #000000 100%);
+  }
   #ui { position: fixed; top: 14px; left: 14px; z-index: 10; display: flex; gap: 8px; align-items: center; }
   button { background: #0e0e0e; color: #fff; border: 1px solid #2a2a2a; padding: 8px 14px; font: inherit; cursor: pointer; letter-spacing: 0.02em; }
   button:hover { background: #181818; border-color: #444; }
 
   #transport {
     position: fixed; left: 0; right: 0; bottom: 0;
-    display: grid; grid-template-columns: auto 1fr auto;
+    display: grid; grid-template-columns: auto 1fr auto auto auto auto auto;
     align-items: center; gap: 12px;
     padding: 12px 16px 14px;
     background: linear-gradient(to top, rgba(0,0,0,0.75), rgba(0,0,0,0));
@@ -36,26 +44,87 @@
   }
 
   #hint { position: fixed; bottom: 50px; right: 14px; opacity: 0.4; }
+
+  /* Track selector (top-right) — clickable dropdown that lists every song
+     in the viewer directory. Picks the current song on load. */
+  #track-label {
+    position: fixed; top: 14px; right: 14px;
+    font: inherit; font-variant: small-caps; letter-spacing: 0.08em;
+    color: #fff; font-size: 11px; opacity: 0.75;
+    z-index: 10; text-align: right; max-width: 50vw;
+    background: transparent; border: 0; cursor: pointer;
+    padding: 4px 6px;
+    -webkit-appearance: none; appearance: none;
+  }
+  #track-label:hover { opacity: 1; background: rgba(255,255,255,0.08); }
+  #track-label option { background: #0e0e0e; color: #fff; font-variant: normal; }
+
+  /* On-canvas recording indicator. Shown only while MediaRecorder is active. */
+  #rec-indicator {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+    display: none; align-items: center; gap: 8px;
+    font-variant: small-caps; letter-spacing: 0.14em;
+    color: #ff5070; font-size: 11px; z-index: 11; pointer-events: none;
+  }
+  #rec-indicator.on { display: flex; }
+  #rec-indicator::before {
+    content: ''; width: 9px; height: 9px; border-radius: 50%;
+    background: #ff2848; box-shadow: 0 0 10px rgba(255, 40, 72, 0.85);
+    animation: rec-blink 1s infinite;
+  }
+
+  /* First-load title card. Auto-fades on first play. */
+  #title-card {
+    position: fixed; left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center; color: #fff; z-index: 9;
+    pointer-events: none; transition: opacity 1.2s ease-out;
+  }
+  #title-card .t { font-size: 22px; letter-spacing: 0.04em; opacity: 0.95; }
+  #title-card .h { font-size: 11px; opacity: 0.5; margin-top: 14px; font-variant: small-caps; letter-spacing: 0.18em; }
+  #title-card.hidden { opacity: 0; }
+
+  /* Aspect cycle button — sits next to record in the transport. */
+  #aspect { padding: 6px 10px; font-size: 11px; opacity: 0.85; }
+  #mode { padding: 6px 10px; font-size: 11px; opacity: 0.85; }
+  #shape { padding: 6px 10px; font-size: 11px; opacity: 0.85; }
+
+  /* Record button — dim outlined circle when idle, bright red dot while recording. */
+  #record { display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; }
+  #record::before {
+    content: ''; width: 8px; height: 8px; border-radius: 50%;
+    background: transparent; border: 1px solid #888;
+    box-sizing: border-box;
+  }
   #record.on { background: #7a0014; border-color: #b6001e; color: #fff; }
-  #record.on::before { content: '● '; animation: rec-blink 1s infinite; }
+  #record.on::before {
+    background: #ff2848; border-color: #ff2848;
+    box-shadow: 0 0 6px rgba(255, 40, 72, 0.85);
+    animation: rec-blink 1s infinite;
+  }
   @keyframes rec-blink { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
   canvas { display: block; }
 </style>
 </head>
 <body>
-<div id="hint">drag · scroll · F follow · [ ← advance / ] → delay</div>
+<div id="hint">R record · M mode · 0–9 focus stem · [ ← advance / ] → delay</div>
 <div id="focus" style="position:fixed;top:14px;left:14px;font-variant:small-caps;letter-spacing:0.08em;color:#fff;font-family:ui-monospace,Menlo,monospace;font-size:11px;z-index:10;pointer-events:none;display:none;"></div>
-<div id="lead" style="position:fixed;top:14px;right:14px;font-variant:small-caps;letter-spacing:0.08em;color:#fff;font-family:ui-monospace,Menlo,monospace;font-size:11px;z-index:10;pointer-events:none;opacity:0.7;text-align:right;"></div>
-<div style="position:fixed;top:36px;right:14px;z-index:10;pointer-events:none;display:flex;flex-direction:column;gap:6px;align-items:flex-end;font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#fff;">
-  <div style="display:flex;align-items:center;gap:8px;opacity:0.7">audio onset<div id="beat-dot" style="width:14px;height:14px;border-radius:50%;background:#fff;opacity:0;box-shadow:0 0 8px rgba(255,255,255,0.8);"></div></div>
-  <div style="display:flex;align-items:center;gap:8px;opacity:0.7">cloud fires<div id="cloud-dot" style="width:14px;height:14px;border-radius:50%;background:#5af;opacity:0;box-shadow:0 0 8px rgba(85,170,255,0.8);"></div></div>
+<select id="track-label" title="Select song"></select>
+<div id="rec-indicator">recording</div>
+
+<div id="title-card">
+  <div class="t"></div>
+  <div class="h">press ▶ or R</div>
 </div>
 
 <div id="transport">
   <button id="play">▶</button>
   <input id="scrub" type="range" min="0" max="1000" step="1" value="0">
   <span class="tc" id="tc">0:00 / 0:00</span>
-  <button id="record" title="Press R">● rec</button>
+  <button id="mode" title="Visualizer (M)">cloud</button>
+  <button id="shape" title="Shape (lights mode)">helix</button>
+  <button id="aspect" title="Aspect ratio">fill</button>
+  <button id="record" title="Press R">rec</button>
 </div>
 
 <script type="importmap">
@@ -74,13 +143,56 @@ import { EffectComposer }    from 'three/addons/postprocessing/EffectComposer.js
 import { RenderPass }        from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass }        from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass }   from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { BokehPass }         from 'three/addons/postprocessing/BokehPass.js';
 
 // Load the song named in ?song=<slug>, falling back to 'dream'.
 const params = new URLSearchParams(location.search);
 const SLUG = params.get('song') || 'dream';
 const data = await (await fetch(`./${SLUG}.json`)).json();
 document.title = `${data.title ?? SLUG} — latent space`;
+{
+  const label = data.title ?? SLUG;
+  const titleCardT = document.querySelector('#title-card .t');
+  if (titleCardT) titleCardT.textContent = label;
+
+  // Song selector — listed in the order we want them to appear in the
+  // dropdown. Hard-coded because we don't have a manifest endpoint.
+  // Songs without precomputed embeddings (no UMAP cloud) only work in
+  // helix/torus modes; the cloud will render empty.
+  const SONGS = [
+    { slug: 'dream',             title: 'dream' },
+    { slug: 'flume-free',        title: 'Flume — Free' },
+    { slug: 'flume-free-stems',  title: 'Flume — Free (stems)' },
+    { slug: 'le-samedi-soir',    title: 'Le Samedi soir' },
+    { slug: '71m3',              title: 'Flume — 71m3' },
+    { slug: 'amber',             title: 'Flume — Amber' },
+    { slug: 'wormhole',          title: 'Flume — Wormhole' },
+    { slug: 'possum',            title: 'Flume — Possum' },
+    { slug: 'some-minds',        title: 'Flume — Some Minds' },
+    { slug: 'helix',             title: 'Flume — Helix' },
+    { slug: 'zodiac-shit',       title: 'Flying Lotus — Zodiac Shit' },
+    { slug: 'mad-rush',          title: 'Brubaker & Cooper — Mad Rush' },
+  ];
+  const sel = document.getElementById('track-label');
+  for (const s of SONGS) {
+    const opt = document.createElement('option');
+    opt.value = s.slug;
+    opt.textContent = s.title;
+    if (s.slug === SLUG) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  // If the URL slug isn't in the hard-coded list, surface it as a
+  // disabled option so the dropdown still shows the current song.
+  if (!SONGS.some(s => s.slug === SLUG)) {
+    const opt = document.createElement('option');
+    opt.value = SLUG;
+    opt.textContent = label;
+    opt.selected = true;
+    sel.insertBefore(opt, sel.firstChild);
+  }
+  sel.addEventListener('change', () => {
+    location.search = '?song=' + encodeURIComponent(sel.value);
+  });
+}
 
 // If this is a multi-stem file, try to also load the parent whole-song file
 // (e.g. `flume-free-stems` → `flume-free`) so we can add the full mix as an
@@ -192,29 +304,28 @@ audio.addEventListener('seeked', () => {
     stem.prevVisualIdx = -1;
     stem.advanceClock  = 0;
   }
-  calibOnsetCursor = 0;
-  calibLastIdx     = -1;
 });
 
 // ---------- scene ----------
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000002);  // deepest-space near-black
+// No scene background — the body's radial gradient shows through the
+// transparent canvas. Gives subtle atmospheric depth at no GPU cost.
+scene.background = null;
 // Keep the fog; it only affects materials that opt-in, which the triangle
 // cloud and starfield both don't. Cloud stays crisp near camera, stars
 // stay crisp at distance.
 scene.fog = new THREE.FogExp2(0x000000, 0.06);
 
-// ---------- procedural starfield (skybox substitute) ----------
-// Random points on a large sphere. Four rough color temperatures — white,
-// warm yellow, cool blue, red giant — distributed at realistic proportions.
-// Rendered additively behind the main cloud so it reads as deep space.
+// ---------- procedural starfield (skybox substitute, cloud mode only) ----------
+// Random points on a large sphere with rough stellar color temperatures.
+// Hidden when the spectral modes (helix/torus) are active.
+let starPoints;
 {
   const STAR_COUNT = 7000;
   const starPos   = new Float32Array(STAR_COUNT * 3);
   const starCol   = new Float32Array(STAR_COUNT * 3);
   const starSize  = new Float32Array(STAR_COUNT);
   for (let i = 0; i < STAR_COUNT; i++) {
-    // Uniform distribution on a sphere at radius 30–55
     const u = Math.random() * 2 - 1;
     const theta = Math.random() * 2 * Math.PI;
     const r = 30 + Math.random() * 25;
@@ -222,18 +333,14 @@ scene.fog = new THREE.FogExp2(0x000000, 0.06);
     starPos[i*3]     = r * sinPhi * Math.cos(theta);
     starPos[i*3 + 1] = r * u;
     starPos[i*3 + 2] = r * sinPhi * Math.sin(theta);
-    // Power-law size — mostly small with a few bright giants.
-    starSize[i] = 0.7 + Math.pow(Math.random(), 6) * 1.2;
-    // Color temperature — stars are mostly white, with the tint held back
-    // to 10% of its natural saturation so the field reads as white-ish
-    // with just hints of color rather than a rainbow.
+    starSize[i] = 1.3 + Math.pow(Math.random(), 6) * 0.7;
     const t = Math.random();
     let cr, cg, cb;
     if      (t < 0.55) { cr = 1.00; cg = 0.97; cb = 0.90; }  // yellow-white (G-type)
     else if (t < 0.80) { cr = 0.85; cg = 0.92; cb = 1.00; }  // blue-white (B-type)
     else if (t < 0.95) { cr = 1.00; cg = 0.60; cb = 0.45; }  // red giant (M-type)
     else                { cr = 1.00; cg = 1.00; cb = 1.00; } // pure hot white
-    const SAT = 0.1;
+    const SAT = Math.random() < 0.22 ? 0.6 : 0.12;
     cr = 1.0 - SAT * (1.0 - cr);
     cg = 1.0 - SAT * (1.0 - cg);
     cb = 1.0 - SAT * (1.0 - cb);
@@ -265,16 +372,122 @@ scene.fog = new THREE.FogExp2(0x000000, 0.06);
         vec2 uv = gl_PointCoord - 0.5;
         float d = length(uv);
         if (d > 0.5) discard;
-        // Bright core + soft halo for the tiny-but-glowing-point feel.
         float core = pow(1.0 - d * 2.0, 3.5);
-        gl_FragColor = vec4(vColor, core);
+        gl_FragColor = vec4(vColor * 1.3, core);
       }
     `,
     transparent: true,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
   });
-  scene.add(new THREE.Points(starGeom, starMat));
+  starPoints = new THREE.Points(starGeom, starMat);
+  scene.add(starPoints);
+}
+
+// ---------- procedural nebula skybox (spectral modes only) ----------
+// Large inverted sphere wrapping the scene with a shader-generated nebula:
+// multi-octave value noise produces soft cloud structure, a slow rotation
+// uniform tumbles it over time, and the mesh follows the camera each frame
+// so it reads as infinitely distant (no parallax of the helix against it).
+let nebulaMesh;
+{
+  const nebulaGeom = new THREE.SphereGeometry(50, 32, 16);
+  const nebulaMat  = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 } },
+    side: THREE.BackSide,
+    depthWrite: false,
+    depthTest:  false,
+    vertexShader: `
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vDir;
+      uniform float uTime;
+
+      // Cheap 3D hash → unit float.
+      float hash(vec3 p) {
+        p = fract(p * 0.3183099 + 0.1);
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+      // Trilinear value noise.
+      float noise(vec3 p) {
+        vec3 i = floor(p);
+        vec3 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(
+            mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+            mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+          mix(
+            mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+            mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y),
+          f.z);
+      }
+      // 5-octave fBm with a rotation between octaves and a non-integer
+      // frequency multiplier — kills visible tiling that pure 2x doubling
+      // would produce against the regular noise grid.
+      const mat3 fbmRot = mat3(
+         0.80, -0.60, 0.00,
+         0.36,  0.48, 0.80,
+        -0.48, -0.64, 0.60
+      );
+      float fbm(vec3 p) {
+        float v = 0.0;
+        float a = 0.5;
+        for (int i = 0; i < 5; i++) {
+          v += a * noise(p);
+          p = fbmRot * p * 2.07;
+          a *= 0.5;
+        }
+        return v;
+      }
+
+      void main() {
+        // Compound rotation about three axes at non-integer rate ratios.
+        // The combined instantaneous rotation axis continuously precesses,
+        // so the nebula tumbles at a constantly changing angle rather than
+        // sliding along a single fixed axis.
+        float a = uTime * 0.020;    // X — primary tumble
+        float b = uTime * 0.0115;   // Y
+        float c = uTime * 0.0090;   // Z
+        mat3 rotX = mat3(
+          1.0, 0.0,    0.0,
+          0.0, cos(a), -sin(a),
+          0.0, sin(a),  cos(a)
+        );
+        mat3 rotY = mat3(
+          cos(b), 0.0, sin(b),
+          0.0,    1.0, 0.0,
+          -sin(b),0.0, cos(b)
+        );
+        mat3 rotZ = mat3(
+          cos(c), -sin(c), 0.0,
+          sin(c),  cos(c), 0.0,
+          0.0,     0.0,    1.0
+        );
+        vec3 dir = rotY * rotX * rotZ * vDir;
+
+        // Pure black background with sparse pinpoint stars only — no
+        // nebula clouds (they were creating their own intensity over
+        // stars and made dimmer ones disappear behind cloud regions).
+        vec3 col = vec3(0.0);
+        float s = noise(dir * 250.0);
+        col += vec3(pow(s, 60.0)) * 1.4;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+  });
+  nebulaMesh = new THREE.Mesh(nebulaGeom, nebulaMat);
+  nebulaMesh.renderOrder = -1;     // draw behind everything else
+  nebulaMesh.frustumCulled = false; // we move it to the camera each frame
+  nebulaMesh.visible = false;       // gated by setViewMode
+  scene.add(nebulaMesh);
 }
 
 // ---------- particle emitter (spawned on each fireHit) ----------
@@ -328,7 +541,8 @@ const partMat = new THREE.ShaderMaterial({
   depthWrite: false,
   blending: THREE.AdditiveBlending,
 });
-scene.add(new THREE.Points(partGeom, partMat));
+const partPoints = new THREE.Points(partGeom, partMat);
+scene.add(partPoints);
 
 function emitParticles(x, y, z, r, g, b, count) {
   for (let i = 0; i < count; i++) {
@@ -355,7 +569,8 @@ function emitParticles(x, y, z, r, g, b, count) {
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100);
 camera.position.set(2.4, 1.8, 2.8);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setClearColor(0x000000, 0);
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -369,8 +584,8 @@ document.body.appendChild(renderer.domElement);
 const ChromaticAberrationShader = {
   uniforms: {
     tDiffuse:  { value: null },
-    uStrength: { value: 0.006 },   // base radial offset (higher = stronger split)
-    uCurve:    { value: 1.8 },     // exponent on distance-from-center
+    uStrength: { value: 0.0022 },  // base radial offset (higher = stronger split)
+    uCurve:    { value: 2.2 },     // exponent on distance-from-center
   },
   vertexShader: `
     varying vec2 vUv;
@@ -405,20 +620,21 @@ const composerRT = new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
 });
 const composer = new EffectComposer(renderer, composerRT);
 composer.addPass(new RenderPass(scene, camera));
-// Depth-of-field: subtle focus blur that picks out the cloud's center
-// while letting far regions soften. `focus` is updated every frame from
-// the camera's distance to its current target.
-const bokehPass = new BokehPass(scene, camera, {
-  focus:    1.0,
-  aperture: 0.002,
-  maxblur:  0.004,
-});
-composer.addPass(bokehPass);
-const bloomPass = new UnrealBloomPass(
+// Bloom — convolves bright pixels with a Gaussian-like kernel. Now that
+// the particle fragment is a smooth radial gradient (no hard edge for the
+// kernel to ring around), both passes can be active. Tight = inner glow
+// blending with the dot's own falloff. Wide = soft atmospheric haze.
+const bloomTight = new UnrealBloomPass(
   new THREE.Vector2(innerWidth, innerHeight),
-  1.0, 0.6, 0.9,
+  0.20, 0.50, 0.50,
 );
-composer.addPass(bloomPass);
+const bloomWide  = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  0.10, 1.10, 0.30,
+);
+composer.addPass(bloomTight);
+composer.addPass(bloomWide);
+
 composer.addPass(new ShaderPass(ChromaticAberrationShader));
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -466,7 +682,7 @@ for (let s = 0; s < stemCount; s++) {
     positions[gi*3]     = x;
     positions[gi*3 + 1] = y;
     positions[gi*3 + 2] = z;
-    sizes[gi]    = 0.0125 * (stem.sizeMult ?? 1.0);
+    sizes[gi]    = 0.015 * (stem.sizeMult ?? 1.0);
     loudAttr[gi] = stem.loudness?.[i] ?? 0;
     stemTints[gi*3]     = tR;
     stemTints[gi*3 + 1] = tG;
@@ -522,7 +738,7 @@ const pointMat = new THREE.ShaderMaterial({
       float loudBoost = 0.1 + aLoud * 4.0;
       // Persistent "leading" boost so the playhead triangle is always bigger
       // than idle, plus the transient hit-energy swell on top.
-      float boost = 1.0 + sz * 6.0 * loudBoost + aLead * 2.2;
+      float boost = 1.0 + sz * 6.5 * loudBoost + aLead * 2.2;
       gl_PointSize = aSize * boost * (uPixelScale / -mv.z);
       gl_Position = projectionMatrix * mv;
     }
@@ -596,6 +812,189 @@ const pointIndexAttr = pointGeom.getIndex();
 const pointCloud = new THREE.Points(pointGeom, pointMat);
 scene.add(pointCloud);
 
+// ---------- pitch-helix mode ----------
+// Spectral mode: every quartertone from C2 to C8 is a particle on a vertical
+// helix. Angle around the axis = pitch class (chromatic circle), height =
+// octave. Brightness/size driven by the live FFT magnitude in that pitch's
+// frequency band — so melody, chords, arps, vibrato, and dynamics all fall
+// out of "render the spectrum on the helix."
+const HELIX_MIN_MIDI = -12;      // C-2 (~4 Hz) — subsonic rumble territory
+const HELIX_MAX_MIDI = 144;      // C11 (~33 kHz) — above audible / Nyquist
+const HELIX_PER_OCT  = 24;       // quartertones per octave
+const HELIX_OCTAVES  = (HELIX_MAX_MIDI - HELIX_MIN_MIDI) / 12;
+const HELIX_NUM_BINS = HELIX_OCTAVES * HELIX_PER_OCT;       // 144 particles
+// Per-shape proportions — each spectral shape gets its own radius and
+// vertical spacing so they each read at their best aspect.
+const HELIX_RADIUS         = 0.7;   // standard cylindrical helix
+const HELIX_HEIGHT_PER_OCT = 0.18;
+const UFO_RADIUS           = 1.0;   // wide saucer
+const UFO_HEIGHT_PER_OCT   = 0.10;  // squatter overall shape
+
+// Lazar "sport model" UAP profile — flat-bottomed disc with the rim at the
+// lower quarter, then a squatter dome tapering to a small apex.
+//   t=0.00 → flat-ish disc edge (~40% of max radius)
+//   t=0.25 → equator / rim (max radius)
+//   t=1.00 → dome apex (~10% of max radius)
+function ufoProfile(t) {
+  const EQUATOR_T = 0.25;
+  if (t < EQUATOR_T) {
+    // Lower saucer — disc bottom curving up to the rim.
+    const u = t / EQUATOR_T;
+    return 0.40 + 0.75 * Math.sin(Math.PI * 0.5 * u);
+  }
+  // Upper dome — squatter than a full quarter-cosine: the curve flattens
+  // earlier so the dome reads as a low rounded cap rather than a tall hat.
+  const u = (t - EQUATOR_T) / (1 - EQUATOR_T);
+  const dome = Math.pow(Math.cos(Math.PI * 0.5 * u), 1.7);
+  return 0.10 + 1.05 * dome;
+}
+const UFO_MAX_R = UFO_RADIUS * 1.15;   // peak radius for camera fit
+
+const helixPos     = new Float32Array(HELIX_NUM_BINS * 3);
+// Alternate layout — same particles arranged on a torus. Pitch class wraps
+// around the major (donut) angle; octaves wrap around the tube cross-section
+// so notes one octave apart end up adjacent on the tube circumference,
+// reflecting their musical relatedness.
+const torusPos     = new Float32Array(HELIX_NUM_BINS * 3);
+const TORUS_RING_R = 0.55;  // donut radius, center to tube center
+const TORUS_TUBE_R = 0.28;  // tube thickness
+// Working buffer that the GPU geometry actually points at. setViewMode
+// copies helixPos or torusPos into this when shapes change. Keeping the
+// canonical layouts as their own arrays means we can switch back and
+// forth without corrupting the source data.
+const helixWorkPos = new Float32Array(HELIX_NUM_BINS * 3);
+const helixCol     = new Float32Array(HELIX_NUM_BINS * 3);
+const helixMag     = new Float32Array(HELIX_NUM_BINS);
+const helixFftLo   = new Int32Array(HELIX_NUM_BINS);
+const helixFftHi   = new Int32Array(HELIX_NUM_BINS);
+// Per-bin A-weighting offset (dB) — added to FFT magnitudes so the helix
+// tracks perceived loudness rather than raw spectral energy. The standard
+// IEC 61672 A-curve attenuates bass heavily and leaves 1–4 kHz roughly
+// neutral, matching how the ear actually responds.
+const helixAWeight = new Float32Array(HELIX_NUM_BINS);
+
+const ufoPos = new Float32Array(HELIX_NUM_BINS * 3);
+
+const _helixHSL = new THREE.Color();
+{
+  const yCenterHelix = (HELIX_OCTAVES * HELIX_HEIGHT_PER_OCT) / 2;
+  const yCenterUfo   = (HELIX_OCTAVES * UFO_HEIGHT_PER_OCT) / 2;
+  for (let i = 0; i < HELIX_NUM_BINS; i++) {
+    const midi = HELIX_MIN_MIDI + (i / HELIX_PER_OCT) * 12;
+    const pc   = ((midi % 12) + 12) % 12;
+    const oct  = (midi - HELIX_MIN_MIDI) / 12;
+    const angle = (pc / 12) * Math.PI * 2;
+    const tNorm = oct / HELIX_OCTAVES;
+    // Standard helix: cylindrical, taller / thinner.
+    helixPos[i*3]     = HELIX_RADIUS * Math.cos(angle);
+    helixPos[i*3 + 1] = oct * HELIX_HEIGHT_PER_OCT - yCenterHelix;
+    helixPos[i*3 + 2] = HELIX_RADIUS * Math.sin(angle);
+    // UFO: saucer profile, wider / squatter.
+    const rUfo = UFO_RADIUS * ufoProfile(tNorm);
+    ufoPos[i*3]       = rUfo * Math.cos(angle);
+    ufoPos[i*3 + 1]   = oct * UFO_HEIGHT_PER_OCT - yCenterUfo;
+    ufoPos[i*3 + 2]   = rUfo * Math.sin(angle);
+    // Torus: pitch class around major angle, octave around tube.
+    const major = angle;
+    const minor = (oct / HELIX_OCTAVES) * Math.PI * 2;
+    const tubeR = TORUS_RING_R + TORUS_TUBE_R * Math.cos(minor);
+    torusPos[i*3]     = tubeR * Math.cos(major);
+    torusPos[i*3 + 1] = TORUS_TUBE_R * Math.sin(minor);
+    torusPos[i*3 + 2] = tubeR * Math.sin(major);
+    _helixHSL.setHSL(pc / 12, 0.7, 0.55);
+    helixCol[i*3]     = _helixHSL.r;
+    helixCol[i*3 + 1] = _helixHSL.g;
+    helixCol[i*3 + 2] = _helixHSL.b;
+    // A-weighting (IEC 61672) at this bin's center frequency.
+    const f  = 440 * Math.pow(2, (midi - 69) / 12);
+    const f2 = f * f;
+    const num = (12194 * 12194) * f2 * f2;
+    const den = (f2 + 20.6 * 20.6)
+              * Math.sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9))
+              * (f2 + 12194 * 12194);
+    helixAWeight[i] = 20 * Math.log10(num / den) + 2.00;
+  }
+}
+
+// FFT-bin range for each pitch bin is computed once setupAnalyser knows the
+// sample rate. Helix mode only renders after this is filled in.
+function initHelixBinMap() {
+  const binHz = audioSampleRate / pitchAnalyser.fftSize;
+  const maxFftBin = pitchAnalyser.fftSize / 2 - 1;
+  for (let i = 0; i < HELIX_NUM_BINS; i++) {
+    const midi = HELIX_MIN_MIDI + (i / HELIX_PER_OCT) * 12;
+    const f    = 440 * Math.pow(2, (midi - 69) / 12);
+    const fLo  = f * Math.pow(2, -1/48);   // half a quartertone below
+    const fHi  = f * Math.pow(2, +1/48);   // half a quartertone above
+    helixFftLo[i] = Math.max(1, Math.floor(fLo / binHz));
+    helixFftHi[i] = Math.min(maxFftBin, Math.ceil(fHi / binHz));
+  }
+}
+
+const helixGeom = new THREE.BufferGeometry();
+helixWorkPos.set(helixPos);
+helixGeom.setAttribute('position', new THREE.BufferAttribute(helixWorkPos, 3));
+helixGeom.setAttribute('color',    new THREE.BufferAttribute(helixCol, 3));
+const helixMagAttr = new THREE.BufferAttribute(helixMag, 1);
+helixGeom.setAttribute('aMag', helixMagAttr);
+
+const helixMat = new THREE.ShaderMaterial({
+  uniforms: { uPixelScale: { value: Math.min(devicePixelRatio, 2) * 40.0 } },
+  vertexShader: `
+    attribute vec3 color;
+    attribute float aMag;
+    varying vec3 vColor;
+    varying float vMag;
+    uniform float uPixelScale;
+    void main() {
+      vColor = color;
+      vMag = aMag;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      // Size carries the loudness — small hole vs big hole. Visible floor
+      // so even quiet bins draw as readable sharp pinpoints; aggressive
+      // peak so loud notes balloon dramatically larger.
+      float sz = 0.15 + 7.5 * pow(clamp(aMag, 0.0, 1.0), 1.3);
+      gl_PointSize = sz * (uPixelScale / -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    varying vec3 vColor;
+    varying float vMag;
+    void main() {
+      vec2 uv = gl_PointCoord - 0.5;
+      float d = length(uv);
+      if (d > 0.5) discard;
+      // Smooth radial falloff with a tighter peak — most of the visible
+      // brightness lives in the inner half of the point sprite, with a
+      // fast smooth dropoff in the outer half. The bloom pass adds the
+      // outer atmosphere; this fragment keeps the dot from blurring out
+      // across its full radius.
+      float t = 1.0 - d * 2.0;
+      float core = pow(t, 3.0);
+      // Silver → gold gradient driven by magnitude. Quiet bins read as
+      // cool/silvery, peaks blaze warm gold. Brightness is zero at rest
+      // so the helix is invisible until something is playing in that pitch.
+      vec3 silver = vec3(0.82, 0.86, 0.95);
+      vec3 gold   = vec3(1.00, 0.78, 0.28);
+      vec3 col    = mix(silver, gold, pow(vMag, 0.5));
+      // Single power-curve brightness — a continuous "soft floor" that
+      // quietly suppresses near-noise-floor bins at the bottom and
+      // accelerates rapidly into saturation at the top. No discrete gate
+      // boundary, so the transition is smooth instead of disjunctive.
+      // pow(1.5) keeps very small vMag near-invisible without a knee.
+      float brightness = 5.5 * pow(vMag, 1.5);
+      gl_FragColor = vec4(col * brightness, core);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+const helixPoints = new THREE.Points(helixGeom, helixMat);
+helixPoints.visible = false;
+scene.add(helixPoints);
+
 // Scratch buffers reused each frame for the depth sort.
 const pointCamZ = new Float32Array(N);
 const pointOrder = new Array(N);
@@ -605,7 +1004,14 @@ for (let i = 0; i < N; i++) pointOrder[i] = i;
 
 
 // ---------- audio analyser ----------
+// Two analysers share the same source:
+//   `analyser`      — small FFT (256) for cheap RMS/onset detection used by
+//                     the UMAP cloud + camera amp pulse.
+//   `pitchAnalyser` — large FFT (8192) for log-binned spectral content,
+//                     consumed by the helix-mode visualization for pitch
+//                     localization and vibrato visibility.
 let analyser, freqData, audioStreamDest;
+let pitchAnalyser, pitchFreqData, audioSampleRate;
 function setupAnalyser() {
   if (analyser) return;
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -615,6 +1021,18 @@ function setupAnalyser() {
   analyser.smoothingTimeConstant = 0.1;
   src.connect(analyser);
   analyser.connect(ctx.destination);
+  // High-resolution analyser for pitch-helix mode. Not connected to
+  // destination — it's a side tap, doesn't affect playback.
+  pitchAnalyser = ctx.createAnalyser();
+  pitchAnalyser.fftSize = 8192;
+  pitchAnalyser.smoothingTimeConstant = 0.0;
+  // Explicit dB range so the helix's dB→linear mapping is well-defined.
+  pitchAnalyser.minDecibels = -90;
+  pitchAnalyser.maxDecibels = -10;
+  src.connect(pitchAnalyser);
+  pitchFreqData = new Float32Array(pitchAnalyser.frequencyBinCount);
+  audioSampleRate = ctx.sampleRate;
+  initHelixBinMap();
   // Extra tap for recording: same source fed to a MediaStreamDestination.
   audioStreamDest = ctx.createMediaStreamDestination();
   src.connect(audioStreamDest);
@@ -624,32 +1042,25 @@ function setupAnalyser() {
 // ---------- UI ----------
 // ---------- recording (canvas + audio → webm) ----------
 const recordBtn = document.getElementById('record');
+const recIndicatorEl = document.getElementById('rec-indicator');
 let mediaRecorder = null;
 let recordChunks  = [];
-
-// Save original pass-enabled state so we can restore after recording stops.
-const _passStash = {};
-function setRecordingLiteMode(on) {
-  if (on) {
-    _passStash.bokeh = bokehPass.enabled;
-    bokehPass.enabled = false;  // skips the extra scene depth render
-    // Bloom stays on (it's the signature look) and chromatic aberration
-    // stays on (it's cheap).
-  } else {
-    if ('bokeh' in _passStash) bokehPass.enabled = _passStash.bokeh;
-  }
-}
 
 async function toggleRecord() {
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     mediaRecorder.stop();
-    setRecordingLiteMode(false);
     return;
   }
-  // Require the audio graph to exist so we can tap its stream.
+  // Build the whole recording pipeline BEFORE starting audio playback —
+  // codec probing, MediaStream construction, and especially the first call
+  // to setupAnalyser (which spins up the AudioContext) are heavy enough to
+  // stall the main thread for a few frames. If that hitch lands during the
+  // first frames of playback it gets baked into the recording.
   setupAnalyser();
-  // 30fps recording — half the encoder CPU of 60fps, still smooth for social.
-  const canvasStream = renderer.domElement.captureStream(30);
+  // 60fps recording — Instagram's web upload accepts 60fps and converts
+  // to 30 server-side. Source 60fps gives smoother high-motion frames
+  // before that conversion than recording at 30 directly.
+  const canvasStream = renderer.domElement.captureStream(60);
   const videoTrack   = canvasStream.getVideoTracks()[0];
   const tracks = [videoTrack];
   if (audioStreamDest) tracks.push(audioStreamDest.stream.getAudioTracks()[0]);
@@ -670,7 +1081,7 @@ async function toggleRecord() {
 
   mediaRecorder = new MediaRecorder(combined, {
     mimeType,
-    videoBitsPerSecond: 10_000_000,
+    videoBitsPerSecond: 20_000_000,
   });
   recordChunks = [];
   mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordChunks.push(e.data); };
@@ -683,12 +1094,24 @@ async function toggleRecord() {
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     recordBtn.classList.remove('on');
-    recordBtn.textContent = '● rec';
+    recordBtn.textContent = 'rec';
+    recIndicatorEl.classList.remove('on');
   };
-  setRecordingLiteMode(true);
   mediaRecorder.start(500);
   recordBtn.classList.add('on');
   recordBtn.textContent = 'stop';
+  recIndicatorEl.classList.add('on');
+  dismissTitleCard();
+
+  // Let two frames render so the encoder pipeline is hot and the post-setup
+  // GC/JIT work has settled before we kick audio. ~67ms of idle frames at
+  // the head of the file is far better than a stutter on the first beat.
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  if (audio.paused) {
+    await audio.play();
+    playBtn.textContent = '⏸';
+  }
 }
 recordBtn.addEventListener('click', toggleRecord);
 addEventListener('keydown', (e) => {
@@ -702,10 +1125,20 @@ addEventListener('keydown', (e) => {
 const playBtn = document.getElementById('play');
 const scrub   = document.getElementById('scrub');
 const tcEl    = document.getElementById('tc');
+const titleCard = document.getElementById('title-card');
+
+// Hide the first-load title card on the first play (or record). The CSS
+// transition handles the fade; we tag it once and never restore it.
+function dismissTitleCard() {
+  if (titleCard && !titleCard.classList.contains('hidden')) {
+    titleCard.classList.add('hidden');
+  }
+}
 
 playBtn.addEventListener('click', async () => {
   setupAnalyser();
   if (audio.paused) {
+    dismissTitleCard();
     await audio.play();
     playBtn.textContent = '⏸';
   } else {
@@ -740,16 +1173,144 @@ scrub.addEventListener('pointerup', () => {
   if (wasPlaying) audio.play();
 });
 
-addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
+// ---------- aspect-ratio cycling ----------
+// fill | 16:9 | 4:5 | 9:16 — for previewing how a recording will frame.
+// Letter-/pillar-boxed against the body's black background. The follow-camera
+// pulls back when narrower so the cloud never gets cut off (see followMode).
+// Each non-fill preset has a fixed render-buffer size that matches the
+// platform's native upload spec (e.g., Instagram Stories = 1080×1920).
+// The DISPLAY size is still scaled to fit the viewport, but the renderer
+// produces high-resolution frames for clean uploads regardless of how
+// big the browser window is.
+const ASPECT_PRESETS = [
+  { label: 'fill',  ratio: null,  renderW: 0,    renderH: 0    },
+  { label: '16:9',  ratio: 16/9,  renderW: 1920, renderH: 1080 },
+  { label: '4:5',   ratio: 4/5,   renderW: 1080, renderH: 1350 },
+  { label: '9:16',  ratio: 9/16,  renderW: 1080, renderH: 1920 },
+];
+let aspectIdx = 0;
+let currentAspect = null; // null = fill viewport
+const aspectBtn = document.getElementById('aspect');
+
+// Position the canvas absolutely so we can center letterboxed renderings.
+renderer.domElement.style.position = 'absolute';
+renderer.domElement.style.left = '0';
+renderer.domElement.style.top = '0';
+
+function applyAspect() {
+  const preset = ASPECT_PRESETS[aspectIdx];
+  currentAspect = preset.ratio;
+  aspectBtn.textContent = preset.label;
+
+  // Display dims — sized to fit the viewport with letter-/pillar-boxing.
+  let dw, dh;
+  if (currentAspect == null) {
+    dw = innerWidth; dh = innerHeight;
+  } else {
+    const fitH = innerWidth / currentAspect;
+    if (fitH <= innerHeight) { dw = innerWidth; dh = fitH; }
+    else { dw = innerHeight * currentAspect; dh = innerHeight; }
+  }
+  // H.264 requires even widths/heights.
+  dw = Math.round(dw / 2) * 2;
+  dh = Math.round(dh / 2) * 2;
+
+  // Render dims — fixed export-quality size for non-fill presets.
+  // Recording captures from this buffer regardless of display size, so
+  // a small window still produces a 1080×1920 frame for uploads.
+  let rw, rh;
+  if (preset.renderW > 0) {
+    rw = preset.renderW;
+    rh = preset.renderH;
+  } else {
+    rw = dw; rh = dh;
+  }
+
+  // CSS display sizing (independent of render-buffer size).
+  renderer.domElement.style.width  = `${dw}px`;
+  renderer.domElement.style.height = `${dh}px`;
+  renderer.domElement.style.left   = `${Math.round((innerWidth  - dw) / 2)}px`;
+  renderer.domElement.style.top    = `${Math.round((innerHeight - dh) / 2)}px`;
+  // Render-buffer sizing — `false` keeps the CSS overrides above intact.
+  renderer.setSize(rw, rh, false);
+  composer.setSize(rw, rh);
+  composerRT.setSize(rw, rh);
+  bloomTight.setSize(rw, rh);
+  bloomWide.setSize(rw, rh);
+  camera.aspect = rw / rh;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-  composer.setSize(innerWidth, innerHeight);
-  composerRT.setSize(innerWidth, innerHeight);
-  bloomPass.setSize(innerWidth, innerHeight);
-  bokehPass.setSize(innerWidth, innerHeight);
   pointMat.uniforms.uPixelScale.value = renderer.getPixelRatio() * 40.0;
+  helixMat.uniforms.uPixelScale.value = renderer.getPixelRatio() * 40.0;
+}
+
+aspectBtn.addEventListener('click', () => {
+  aspectIdx = (aspectIdx + 1) % ASPECT_PRESETS.length;
+  applyAspect();
 });
+
+addEventListener('resize', applyAspect);
+applyAspect();
+
+// ---------- visualizer + shape selectors ----------
+// Two top-level visualizers:
+//   'cloud'  → original UMAP cloud (stems, fireHits, follow camera)
+//   'lights' → spectral pitch field (helix / ufo / torus shapes)
+// Within 'lights', the shape selector picks the layout for the same
+// particles + magnitude logic; only the resting position attribute differs.
+const VIEW_MODES    = ['cloud', 'lights'];
+const LIGHTS_SHAPES = ['helix', 'ufo', 'torus'];
+let viewMode    = 'cloud';
+let lightsShape = 'helix';
+const modeBtn       = document.getElementById('mode');
+const shapeBtn      = document.getElementById('shape');
+const focusElForMode = document.getElementById('focus');
+const helixPosAttr  = helixGeom.getAttribute('position');
+
+function applyLightsShape() {
+  if      (lightsShape === 'helix') helixWorkPos.set(helixPos);
+  else if (lightsShape === 'ufo')   helixWorkPos.set(ufoPos);
+  else if (lightsShape === 'torus') helixWorkPos.set(torusPos);
+  helixPosAttr.needsUpdate = true;
+}
+
+function setLightsShape(s) {
+  lightsShape = s;
+  shapeBtn.textContent = s;
+  applyLightsShape();
+}
+
+function setViewMode(m) {
+  viewMode = m;
+  modeBtn.textContent = m;
+  const isLights = (m === 'lights');
+  helixPoints.visible = isLights;
+  pointCloud.visible  = !isLights;
+  partPoints.visible  = !isLights;
+  // The starfield belongs to cloud mode; the nebula skybox to lights.
+  if (starPoints)  starPoints.visible  = !isLights;
+  if (nebulaMesh)  nebulaMesh.visible  =  isLights;
+  // The shape selector is only meaningful in lights mode.
+  shapeBtn.style.display = isLights ? '' : 'none';
+  if (isLights) applyLightsShape();
+  // Focus-stem indicator is meaningless in lights mode (no stems).
+  if (focusElForMode && stemCount > 1) {
+    focusElForMode.style.display = isLights ? 'none' : '';
+  }
+}
+
+modeBtn.addEventListener('click', () => {
+  const next = VIEW_MODES[(VIEW_MODES.indexOf(viewMode) + 1) % VIEW_MODES.length];
+  setViewMode(next);
+});
+shapeBtn.addEventListener('click', () => {
+  const next = LIGHTS_SHAPES[(LIGHTS_SHAPES.indexOf(lightsShape) + 1) % LIGHTS_SHAPES.length];
+  setLightsShape(next);
+});
+
+// Apply the initial view-mode state explicitly so the cloud / spectral
+// gating flags (starfield visibility) are in sync. If
+// this song has no precomputed UMAP cloud, default to helix.
+setViewMode(stemN === 0 ? 'lights' : 'cloud');
 
 // ---------- animation ----------
 const aTimeAttr  = pointGeom.getAttribute('aTime');
@@ -791,67 +1352,47 @@ function updateOnset(dt) {
 }
 
 let lastTime = performance.now();
+let helixPeakDb = -30; // auto-gain peak follower for helix mode
 
-// ---------- follow camera (toggled with F) ----------
-// In follow mode we bypass OrbitControls and drive the camera directly:
+// ---------- follow camera (always on) ----------
+// We bypass OrbitControls and drive the camera directly:
 //  - position eased toward an adaptive orbit around the action centroid
 //  - orientation slerped in quaternion space toward a look-at target
-let followMode = false;
+const followMode = true;
 const followTarget = new THREE.Vector3();   // smoothed aim point
 const followCamPos = new THREE.Vector3();   // smoothed camera position
 const followCamQuat = new THREE.Quaternion(); // smoothed orientation
+followTarget.copy(controls.target);
+followCamPos.copy(camera.position);
+followCamQuat.copy(camera.quaternion);
+controls.enabled = false;
 
-function enterFollowMode() {
-  followMode = true;
-  followTarget.copy(controls.target);
-  followCamPos.copy(camera.position);
-  followCamQuat.copy(camera.quaternion);
-  controls.enabled = false;
-}
-function exitFollowMode() {
-  followMode = false;
-  controls.target.copy(followTarget);
-  controls.enabled = true;
-  controls.update();
-}
 // Which stem the follow camera focuses on. -1 means "weighted blend of all stems".
-// Keys 1..stemCount pick a single stem; 0 returns to the blend.
-let focusStem = stemCount > 1 ? 0 : -1;
+// Keys 1..stemCount pick a single stem; 0 returns to the blend (default).
+let focusStem = -1;
 const focusEl = document.getElementById('focus');
 
 // Visual lead (seconds ahead/behind of audio). Adjustable live via [ and ].
 // Empirically calibrated: +700ms covers chunk-start alignment (~500ms)
 // plus ~200ms of additional audio/display latency in this setup.
 let VISUAL_LEAD = 0.7;
-const leadEl = document.getElementById('lead');
-const beatDotEl = document.getElementById('beat-dot');
-const cloudDotEl = document.getElementById('cloud-dot');
-let cloudDotPulse = 0;
-// Calibration cloud-dot driven by the primary stem's precomputed onsets.
-const primaryStem = stemList.find(s => s.name === 'mix') || stemList[0];
-let calibOnsetCursor = 0;
-let calibLastIdx = -1;
-function updateLeadUI() {
-  const ms = Math.round(VISUAL_LEAD * 1000);
-  leadEl.textContent = `lead ${ms >= 0 ? '+' : ''}${ms}ms`;
-}
-updateLeadUI();
 
 addEventListener('keydown', (e) => {
-  if (e.key === 'f' || e.key === 'F') {
-    if (followMode) exitFollowMode(); else enterFollowMode();
-  } else if (e.key === '[' || e.key === ']' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+  if (e.key === '[' || e.key === ']' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
     // [ / ← advance visuals (fire earlier). ] / → delay them (fire later).
     const advance = e.key === '[' || e.key === 'ArrowLeft';
     const step = (e.shiftKey ? 0.005 : 0.05) * (advance ? 1 : -1);
     VISUAL_LEAD = Math.max(-1, Math.min(1.5, VISUAL_LEAD + step));
-    updateLeadUI();
     e.preventDefault();
   } else if (stemCount > 1 && /^[0-9]$/.test(e.key)) {
     const n = parseInt(e.key, 10);
     if (n === 0) focusStem = -1;
     else if (n >= 1 && n <= stemCount) focusStem = n - 1;
     updateFocusUI();
+  } else if (e.key === 'm' || e.key === 'M') {
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+    const next = VIEW_MODES[(VIEW_MODES.indexOf(viewMode) + 1) % VIEW_MODES.length];
+    setViewMode(next);
   }
 });
 
@@ -894,35 +1435,121 @@ function animate() {
     amp = s / freqData.length / 255;
     updateOnset(dt);
   }
-  // Calibration dots:
-  //   white = live audio-stream onset (ground truth)
-  //   blue  = the cloud reached a precomputed-onset chunk (what the viz is
-  //           responding to). If these pulse in sync the lead is correct.
-  if (beatDotEl) {
-    if (onsetFired) beatDotEl.style.opacity = '1';
-    else beatDotEl.style.opacity = String(Math.max(0, parseFloat(beatDotEl.style.opacity || '0') - dt * 4));
-  }
-  if (cloudDotEl && primaryStem?.onsets) {
-    if (audioReady) {
-      if (audioIdx < calibLastIdx - 2) {
-        calibOnsetCursor = 0;
-        while (calibOnsetCursor < primaryStem.onsets.length
-               && primaryStem.onsets[calibOnsetCursor] < audioIdx) calibOnsetCursor++;
-      }
-      calibLastIdx = audioIdx;
-      while (calibOnsetCursor < primaryStem.onsets.length
-             && primaryStem.onsets[calibOnsetCursor] <= audioIdx) {
-        cloudDotPulse = 1;
-        calibOnsetCursor++;
-      }
+
+
+  // ---------- helix-mode update ----------
+  // Per-pitch-bin magnitude is sampled from the high-resolution analyser and
+  // smoothed with an asymmetric attack/release so beats pop instantly while
+  // sustained notes glow steadily.
+  if (viewMode === 'lights' && pitchAnalyser) {
+    pitchAnalyser.getFloatFrequencyData(pitchFreqData); // values in dB
+
+    // Auto-gain: track the rolling peak of the spectrum so quiet sources
+    // (e.g. a song captured at low volume) still drive the visualizer.
+    // Instant attack — peakDb snaps up to any current frame's max — and a
+    // slow ~3 dB/s release so dynamic peaks don't immediately reset on a
+    // soft passage. Floor of -55 dB so true silence doesn't make the
+    // visualizer noise-reactive.
+    let frameMaxRaw = -100;
+    for (let k = 1; k < pitchFreqData.length; k++) {
+      const v = pitchFreqData[k];
+      if (v > frameMaxRaw) frameMaxRaw = v;
     }
-    cloudDotEl.style.opacity = String(cloudDotPulse);
-    cloudDotPulse = Math.max(0, cloudDotPulse - dt * 4);
+    if (frameMaxRaw > helixPeakDb) helixPeakDb = frameMaxRaw;
+    else helixPeakDb -= 3.0 * dt;
+    if (helixPeakDb < -55) helixPeakDb = -55;
+
+    // Dynamic dB window: PEAK_DB tracks the auto-gain follower. NOISE_DB
+    // is whichever is HIGHER of (peak − range) and an absolute hard floor.
+    // The absolute floor stops the auto-gain from normalizing background
+    // hiss / encoder noise into visibility during quiet sections — without
+    // it, bins above the song's actual content light up just from noise.
+    const PEAK_DB        = helixPeakDb;
+    const dbRange        = 50;
+    const ABS_NOISE_DB   = -65;
+    const NOISE_DB       = Math.max(PEAK_DB - dbRange, ABS_NOISE_DB);
+    const release        = Math.pow(0.5, dt / 0.10); // ~100ms half-life
+    // Scale on the A-weighting curve. 1.0 is full ear-sensitivity correction
+    // (heavy bass attenuation); 0 disables it. 0.30 keeps just enough
+    // perceptual roll-off to prevent bass from overwhelming the rest, while
+    // still letting sub-bass / 808s read clearly.
+    const A_WEIGHT_SCALE = 0.30;
+    for (let i = 0; i < HELIX_NUM_BINS; i++) {
+      let peak = 0;
+      const lo = helixFftLo[i], hi = helixFftHi[i];
+      // Quartertone-wide bin → A-weight is essentially constant inside it,
+      // so hoist the offset out of the inner FFT loop.
+      const aw = helixAWeight[i] * A_WEIGHT_SCALE;
+      for (let k = lo; k <= hi; k++) {
+        const dB = pitchFreqData[k] + aw;
+        if (dB <= NOISE_DB) continue;
+        let v = (dB - NOISE_DB) / dbRange;
+        if (v > 1) v = 1;
+        v = Math.pow(v, 1.5); // softer gamma — moderate notes still visible
+        if (v > peak) peak = v;
+      }
+      const cur = helixMag[i];
+      helixMag[i] = peak > cur ? peak : cur * release;
+    }
+    helixMagAttr.needsUpdate = true;
   }
 
-
-  if (followMode) {
-    const LEAD_CHUNKS = 10;
+  // ---------- camera ----------
+  if (viewMode === 'lights') {
+    // Slow continuous orbit, with the radius computed to fit the active
+    // shape's bounding box into the frame (with margin for particle size).
+    const ts = now / 1000;
+    if (nebulaMesh && nebulaMesh.visible) {
+      nebulaMesh.material.uniforms.uTime.value = ts;
+    }
+    const vfovHalf = (camera.fov * Math.PI) / 360;
+    const hfovHalf = Math.atan(camera.aspect * Math.tan(vfovHalf));
+    // Fit the active shape's bounding sphere into the frame. Using sin
+    // (proper angular extent of a sphere) instead of tan means the fit is
+    // correct from any camera angle and aspect ratio. Vertical extent uses
+    // an "effective" 10-octave range (centered on C0–C9 where ~all music
+    // lives) instead of the full 13-octave range — the extreme top/bottom
+    // octaves render but rarely have content, and including them in the fit
+    // would zoom the whole shape out unnecessarily.
+    const FIT_OCTAVES = 10;
+    let sphereR;
+    if (lightsShape === 'helix') {
+      const halfV = (FIT_OCTAVES * HELIX_HEIGHT_PER_OCT) / 2;
+      sphereR = Math.sqrt(halfV * halfV + HELIX_RADIUS * HELIX_RADIUS);
+    } else if (lightsShape === 'ufo') {
+      const halfV = (FIT_OCTAVES * UFO_HEIGHT_PER_OCT) / 2;
+      sphereR = Math.sqrt(halfV * halfV + UFO_MAX_R * UFO_MAX_R);
+    } else { // torus
+      sphereR = TORUS_RING_R + TORUS_TUBE_R;
+    }
+    const fitHalf = Math.min(vfovHalf, hfovHalf);
+    // 1.25× margin — tighter than before so the shape fills more of the
+    // frame; particles + bloom still have headroom.
+    const orbitR = (sphereR / Math.sin(fitHalf)) * 1.25;
+    let tilt;
+    if (lightsShape === 'torus') {
+      // Tilt the camera ~28° down so the donut hole is visible.
+      tilt = orbitR * 0.53;
+    } else {
+      // helix / ufo — orbit near the equator with a gentle Y-drift.
+      tilt = 0.04 + 0.08 * Math.sin(ts * 0.07);
+    }
+    camera.position.set(
+      orbitR * Math.cos(ts * 0.08),
+      tilt,
+      orbitR * Math.sin(ts * 0.08),
+    );
+    camera.lookAt(0, 0, 0);
+    // Lock nebula to the camera's pose (position + orientation) so the
+    // camera's orbit around the lights doesn't drag the nebula across the
+    // screen. The only visible nebula motion is the shader's own internal
+    // rotation, which is on a tilted, drifting axis — clearly decoupled.
+    if (nebulaMesh && nebulaMesh.visible) {
+      nebulaMesh.position.copy(camera.position);
+      nebulaMesh.quaternion.copy(camera.quaternion);
+    }
+  } else if (followMode) {
+    const LEAD_CHUNKS = 24;
     const leadIdx = Math.min(stemN - 1, audioIdx + LEAD_CHUNKS);
     const WIN = 20, SIGMA = 10;
     const iLo = Math.max(0, leadIdx - WIN);
@@ -955,7 +1582,11 @@ function animate() {
     _centroid.set(cx / cw, cy / cw, cz / cw);
 
     // Spread = RMS distance from centroid over whichever stems we're following.
+    // Also track the actual lead position (mean over iterated stems) so we can
+    // ensure the orbit radius keeps the camera beyond the lead chunk —
+    // otherwise the lead can drift in toward (or behind) the camera.
     let ss = 0, sw = 0;
+    let lpx = 0, lpy = 0, lpz = 0;
     for (const s of stemIter) {
       const off3 = s * stemN * 3;
       const li = off3 + leadIdx * 3;
@@ -964,16 +1595,42 @@ function animate() {
       const dz = positions[li + 2] - _centroid.z;
       ss += dx*dx + dy*dy + dz*dz;
       sw += 1;
+      lpx += positions[li];
+      lpy += positions[li + 1];
+      lpz += positions[li + 2];
     }
     const spread = sw > 0 ? Math.sqrt(ss / sw) : 0.3;
+    lpx /= sw; lpy /= sw; lpz /= sw;
+    const leadFromTarget = Math.sqrt(
+      (lpx - _centroid.x) ** 2 +
+      (lpy - _centroid.y) ** 2 +
+      (lpz - _centroid.z) ** 2
+    );
 
     // --- smooth target (longer time-constant so focus-switches ease in) ---
-    const tLerp = 1 - Math.exp(-dt / 1.3);
+    // With the longer LEAD_CHUNKS lookahead the centroid is already biased
+    // toward the future, so we can keep this fairly heavy and still feel
+    // anticipatory rather than chase-y.
+    const tLerp = 1 - Math.exp(-dt / 1.8);
     followTarget.lerp(_centroid, tLerp);
 
     // --- desired camera position: slow auto-orbit at adaptive distance ---
     const now2 = now / 1000;
-    const desiredRadius = Math.max(0.112, spread * 1.36 + 0.104) * (1.0 + amp * 0.4);
+    // Radius floor scales with how far the lead is from the centroid, so when
+    // the lead juts out toward us the orbit grows to keep it in front.
+    // Aspect-fit: when the horizontal FOV is narrower than the vertical
+    // (portrait/square presets), the cloud needs more camera distance to fit
+    // its horizontal extent. Multiply the orbit radius by the ratio of
+    // tan(vfov/2) over tan(min(vfov,hfov)/2) so neither axis cuts off.
+    const _vfovHalf = (camera.fov * Math.PI) / 360;
+    const _hfovHalf = Math.atan(camera.aspect * Math.tan(_vfovHalf));
+    const _fitHalf  = Math.min(_vfovHalf, _hfovHalf);
+    const aspectFitMult = Math.tan(_vfovHalf) / Math.tan(_fitHalf);
+
+    // 0.28 baseline keeps quiet sections from collapsing into a one-pixel
+    // dot — small clouds still get a recognizable establishing shot.
+    const radiusFloor = (leadFromTarget * 1.5 + 0.28) * aspectFitMult;
+    const desiredRadius = Math.max(radiusFloor, (spread * 1.6 + 0.28) * aspectFitMult) * (1.0 + amp * 0.3);
     // Smooth the radius separately so focus-switches (which can change
     // spread abruptly) don't cause the camera to rush in or out.
     const rLerp = 1 - Math.exp(-dt / 1.3);
@@ -990,15 +1647,16 @@ function animate() {
     // Smooth the camera position (gives cinematic feel on view changes).
     // Then enforce a minimum distance from the target so even during the
     // smoothing-induced lag, the lead can't approach or pass behind us.
-    const pLerp = 1 - Math.exp(-dt / 0.9);  // 0.9s — smooth but responsive
+    const pLerp = 1 - Math.exp(-dt / 1.6);  // 1.6s — calmer tracking
     followCamPos.lerp(_desiredP, pLerp);
 
-    const MIN_CAM_DIST_FACTOR = 0.7;
     const awayX = followCamPos.x - followTarget.x;
     const awayY = followCamPos.y - followTarget.y;
     const awayZ = followCamPos.z - followTarget.z;
     const curDist = Math.sqrt(awayX * awayX + awayY * awayY + awayZ * awayZ);
-    const minDist = radius * MIN_CAM_DIST_FACTOR;
+    // Hard minimum: stay beyond the lead by a margin even while the smoothed
+    // followRadius is catching up to a sudden expansion.
+    const minDist = Math.max(radius * 0.7, leadFromTarget * 1.15 + 0.12);
     if (curDist < minDist && curDist > 1e-4) {
       const k = minDist / curDist;
       followCamPos.set(
@@ -1012,7 +1670,7 @@ function animate() {
     // --- quaternion slerp toward look-at ---
     _lookM.lookAt(camera.position, followTarget, _upVec);
     _desiredQ.setFromRotationMatrix(_lookM);
-    const qLerp = 1 - Math.exp(-dt / 0.5);
+    const qLerp = 1 - Math.exp(-dt / 0.8);
     followCamQuat.slerp(_desiredQ, qLerp);
     camera.quaternion.copy(followCamQuat);
   } else {
@@ -1138,11 +1796,6 @@ function animate() {
   const dur = isFinite(audio.duration) ? audio.duration : data.duration;
   tcEl.textContent = `${fmt(t)} / ${fmt(dur)}`;
   if (!scrubbing) scrub.value = Math.round((t / dur) * 1000);
-
-  // Keep DOF focus locked on the cloud center (follow target in follow mode,
-  // orbit target otherwise). Distance in world units = camera → target.
-  const focusTarget = followMode ? followTarget : controls.target;
-  bokehPass.uniforms.focus.value = camera.position.distanceTo(focusTarget);
 
   composer.render();
 }
